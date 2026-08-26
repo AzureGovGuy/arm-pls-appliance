@@ -4,14 +4,14 @@ param(
     [string] $ResourceGroupName,
 
     [Parameter(Mandatory)]
-    [string] $TargetPrivateIp,
+    [string] $TargetSQLServer,
 
     [Parameter(Mandatory)]
     [string] $AdminSshPublicKey,
 
     [string] $Location = "eastus2",
     [string] $Prefix = "customer-pls-lab",
-    [int] $TargetPort = 8080,
+    [int] $TargetPort = 1433,
     [string[]] $ConsumerSubscriptionIds = @((az account show --query id -o tsv)),
     [switch] $AutoApproveConsumers
 )
@@ -32,7 +32,7 @@ az deployment group create `
     --template-file $templateFile `
     --parameters `
         prefix=$Prefix `
-        targetPrivateIp=$TargetPrivateIp `
+        targetSQLServer=$TargetSQLServer `
         targetPort=$TargetPort `
         adminSshPublicKey=$AdminSshPublicKey `
         "consumerSubscriptionIds=$consumerSubscriptionIdsJson" `

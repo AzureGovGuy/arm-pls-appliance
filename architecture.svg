@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1520" height="860" viewBox="0 0 1520 860" role="img" aria-labelledby="title description">
   <title id="title">Private Link forwarding appliance architecture</title>
-  <desc id="description">Traffic flows from a customer-owned Fabric or Data Factory managed private endpoint through a deployed Private Link Service, Standard internal load balancer, and Ubuntu forwarding VM, then through customer-owned peering and routing to a private target.</desc>
+  <desc id="description">Traffic flows from a customer-owned Fabric or Data Factory managed private endpoint through a deployed Private Link Service, Standard internal load balancer, and Ubuntu forwarding VM, then through customer-owned peering and routing to a target SQL Server.</desc>
   <defs>
     <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
       <path d="M0,0 L0,6 L9,3 z" fill="#0078d4"/>
@@ -35,7 +35,7 @@
 
   <rect width="1520" height="860" fill="#ffffff"/>
   <text x="40" y="52" class="title">Private Link forwarding appliance</text>
-  <text x="40" y="82" class="subtitle">Resources created by azuredeploy.json and the customer-owned connections required to reach a private target</text>
+  <text x="40" y="82" class="subtitle">Resources created by azuredeploy.json and the customer-owned connections required to reach a target SQL Server</text>
 
   <rect x="30" y="135" width="235" height="510" rx="8" class="external"/>
   <text x="50" y="170" class="section">Customer managed</text>
@@ -75,7 +75,7 @@
   <text x="740" y="374" text-anchor="middle" class="label">Standard internal LB</text>
   <text x="740" y="398" text-anchor="middle" class="detail">{prefix}-internal-lb</text>
   <text x="740" y="425" text-anchor="middle" class="detail">Frontend 10.20.2.4</text>
-  <text x="740" y="448" text-anchor="middle" class="small">TCP targetPort + probe</text>
+  <text x="740" y="448" text-anchor="middle" class="small">TCP 1433 by default + probe</text>
 
   <rect x="890" y="230" width="280" height="405" rx="8" class="subnet"/>
   <text x="910" y="260" class="label">Forwarder subnet</text>
@@ -116,9 +116,9 @@
   <text x="1373" y="352" text-anchor="middle" class="small">Optional UDR to firewall/NVA</text>
 
   <rect x="1280" y="450" width="185" height="105" rx="8" class="customer" filter="url(#shadow)"/>
-  <text x="1373" y="484" text-anchor="middle" class="label">Private target</text>
-  <text x="1373" y="509" text-anchor="middle" class="detail">targetPrivateIp</text>
-  <text x="1373" y="532" text-anchor="middle" class="detail">targetPort</text>
+  <text x="1373" y="484" text-anchor="middle" class="label">Target SQL Server</text>
+  <text x="1373" y="509" text-anchor="middle" class="detail">targetSQLServer</text>
+  <text x="1373" y="532" text-anchor="middle" class="detail">TCP 1433 by default</text>
 
   <path d="M1140 552 L1215 552 L1215 325 L1280 325" class="customer-arrow"/>
   <text x="1178" y="535" class="flow">Forwarded traffic</text>

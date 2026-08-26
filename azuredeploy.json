@@ -49,15 +49,15 @@
       "type": "string",
       "defaultValue": "10.20.3.4"
     },
-    "targetPrivateIp": {
+    "targetSQLServer": {
       "type": "string",
       "metadata": {
-        "description": "Private IPv4 address reached through hub/spoke peering. The forwarding VM DNATs incoming traffic to this address."
+        "description": "Private IPv4 address of the target SQL Server reached through hub/spoke or hybrid connectivity."
       }
     },
     "targetPort": {
       "type": "int",
-      "defaultValue": 8080,
+      "defaultValue": 1433,
       "minValue": 1,
       "maxValue": 65535
     },
@@ -305,7 +305,7 @@
         "osProfile": {
           "computerName": "[variables('vmName')]",
           "adminUsername": "[parameters('adminUsername')]",
-          "customData": "[base64(format(variables('cloudInitTemplate'), parameters('targetPrivateIp'), parameters('targetPort')))]",
+          "customData": "[base64(format(variables('cloudInitTemplate'), parameters('targetSQLServer'), parameters('targetPort')))]",
           "linuxConfiguration": {
             "disablePasswordAuthentication": true,
             "ssh": {
@@ -423,7 +423,7 @@
     },
     "target": {
       "type": "string",
-      "value": "[format('{0}:{1}', parameters('targetPrivateIp'), parameters('targetPort'))]"
+      "value": "[format('{0}:{1}', parameters('targetSQLServer'), parameters('targetPort'))]"
     }
   }
 }

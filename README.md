@@ -25,10 +25,10 @@ Fabric or ADF managed private endpoint
   -> Standard internal load balancer
   -> forwarding VM
   -> peered hub/spoke network
-  -> targetPrivateIp:targetPort
+  -> targetSQLServer:targetPort
 ```
 
-The forwarding VM applies both DNAT and MASQUERADE. The target sees the source as the forwarding VM private IP. The target must be reachable from the appliance VNet after the customer creates peering and any required hub routes or firewall rules.
+`targetSQLServer` is the private IPv4 address of the destination SQL Server, including an on-premises server reached through ExpressRoute or a site-to-site VPN. The forwarding VM applies both DNAT and MASQUERADE. SQL Server sees the source as the forwarding VM private IP. The server must be reachable from the appliance VNet after the customer creates peering and any required hub routes or firewall rules.
 
 ## Deploy
 
@@ -45,8 +45,8 @@ Run the helper script with an existing SSH public key:
 ./deploy.ps1 `
   -ResourceGroupName rg-customer-pls-lab `
   -Location eastus2 `
-  -TargetPrivateIp 10.40.1.4 `
-  -TargetPort 8080 `
+  -TargetSQLServer 10.40.1.4 `
+  -TargetPort 1433 `
   -AdminSshPublicKey (Get-Content ~/.ssh/id_ed25519.pub -Raw) `
   -ConsumerSubscriptionIds <fabric-or-adf-subscription-id>
 ```
