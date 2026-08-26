@@ -13,6 +13,10 @@ This resource-group-scoped ARM template deploys the provider side of a Private L
 
 The template does not create Fabric, Azure Data Factory, a managed private endpoint, hub peering, a route table, or the destination service. Those remain customer-owned integration steps.
 
+## Architecture
+
+[![Private Link forwarding appliance architecture](architecture.svg)](architecture.svg)
+
 ## Traffic path
 
 ```text

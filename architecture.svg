@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1520" height="860" viewBox="0 0 1520 860" role="img" aria-labelledby="title description">
+  <title id="title">Private Link forwarding appliance architecture</title>
+  <desc id="description">Traffic flows from a customer-owned Fabric or Data Factory managed private endpoint through a deployed Private Link Service, Standard internal load balancer, and Ubuntu forwarding VM, then through customer-owned peering and routing to a private target.</desc>
+  <defs>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#0078d4"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#ca5010"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000000" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .title { font: 700 30px 'Segoe UI', sans-serif; fill: #172b3a; }
+      .subtitle { font: 16px 'Segoe UI', sans-serif; fill: #40566b; }
+      .section { font: 700 18px 'Segoe UI', sans-serif; fill: #172b3a; }
+      .label { font: 600 15px 'Segoe UI', sans-serif; fill: #172b3a; }
+      .detail { font: 13px 'Segoe UI', sans-serif; fill: #30475b; }
+      .small { font: 12px 'Segoe UI', sans-serif; fill: #40566b; }
+      .flow { font: 600 13px 'Segoe UI', sans-serif; fill: #005a9e; }
+      .external { fill: #ffffff; stroke: #69797e; stroke-width: 2; stroke-dasharray: 8 6; }
+      .resource-group { fill: #f7fbff; stroke: #0078d4; stroke-width: 3; }
+      .vnet { fill: #ffffff; stroke: #0078d4; stroke-width: 2; }
+      .subnet { fill: #f3f2f1; stroke: #8a8886; stroke-width: 1.5; }
+      .network { fill: #cfe4fa; stroke: #0078d4; stroke-width: 2; }
+      .compute { fill: #dff6dd; stroke: #107c10; stroke-width: 2; }
+      .security { fill: #fff4ce; stroke: #ca5010; stroke-width: 2; }
+      .customer { fill: #f3f2f1; stroke: #605e5c; stroke-width: 2; }
+      .arrow { fill: none; stroke: #0078d4; stroke-width: 3; marker-end: url(#arrow-blue); }
+      .customer-arrow { fill: none; stroke: #ca5010; stroke-width: 3; stroke-dasharray: 8 6; marker-end: url(#arrow-orange); }
+      .association { fill: none; stroke: #605e5c; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    </style>
+  </defs>
+
+  <rect width="1520" height="860" fill="#ffffff"/>
+  <text x="40" y="52" class="title">Private Link forwarding appliance</text>
+  <text x="40" y="82" class="subtitle">Resources created by azuredeploy.json and the customer-owned connections required to reach a private target</text>
+
+  <rect x="30" y="135" width="235" height="510" rx="8" class="external"/>
+  <text x="50" y="170" class="section">Customer managed</text>
+  <text x="50" y="194" class="small">Not deployed by this template</text>
+
+  <rect x="55" y="285" width="185" height="130" rx="8" class="customer" filter="url(#shadow)"/>
+  <text x="148" y="323" text-anchor="middle" class="label">Microsoft Fabric</text>
+  <text x="148" y="346" text-anchor="middle" class="label">or Azure Data Factory</text>
+  <text x="148" y="378" text-anchor="middle" class="detail">Managed private endpoint</text>
+  <text x="148" y="397" text-anchor="middle" class="small">Uses the PLS alias</text>
+
+  <rect x="295" y="110" width="930" height="625" rx="8" class="resource-group"/>
+  <text x="320" y="146" class="section">Deployed resource group</text>
+  <text x="1175" y="146" text-anchor="end" class="small">6 top-level ARM resources</text>
+
+  <rect x="325" y="170" width="870" height="500" rx="8" class="vnet"/>
+  <text x="350" y="204" class="section">Virtual network: {prefix}-vnet</text>
+  <text x="1170" y="204" text-anchor="end" class="detail">Default 10.20.0.0/16</text>
+
+  <rect x="350" y="230" width="240" height="370" rx="8" class="subnet"/>
+  <text x="370" y="260" class="label">PLS NAT subnet</text>
+  <text x="370" y="282" class="small">private-link-service-nat-subnet</text>
+  <text x="370" y="301" class="small">Default 10.20.3.0/24</text>
+
+  <rect x="380" y="340" width="180" height="135" rx="8" class="network" filter="url(#shadow)"/>
+  <text x="470" y="374" text-anchor="middle" class="label">Private Link Service</text>
+  <text x="470" y="398" text-anchor="middle" class="detail">{prefix}-pls</text>
+  <text x="470" y="425" text-anchor="middle" class="detail">NAT IP 10.20.3.4</text>
+  <text x="470" y="448" text-anchor="middle" class="small">Visibility / auto-approval</text>
+
+  <rect x="620" y="230" width="240" height="370" rx="8" class="subnet"/>
+  <text x="640" y="260" class="label">Load balancer subnet</text>
+  <text x="640" y="282" class="small">load-balancer-subnet</text>
+  <text x="640" y="301" class="small">Default 10.20.2.0/24</text>
+
+  <rect x="650" y="340" width="180" height="135" rx="8" class="network" filter="url(#shadow)"/>
+  <text x="740" y="374" text-anchor="middle" class="label">Standard internal LB</text>
+  <text x="740" y="398" text-anchor="middle" class="detail">{prefix}-internal-lb</text>
+  <text x="740" y="425" text-anchor="middle" class="detail">Frontend 10.20.2.4</text>
+  <text x="740" y="448" text-anchor="middle" class="small">TCP targetPort + probe</text>
+
+  <rect x="890" y="230" width="280" height="405" rx="8" class="subnet"/>
+  <text x="910" y="260" class="label">Forwarder subnet</text>
+  <text x="910" y="282" class="small">forwarder-subnet</text>
+  <text x="910" y="301" class="small">Default 10.20.1.0/24</text>
+
+  <rect x="920" y="320" width="220" height="62" rx="8" class="security"/>
+  <text x="1030" y="346" text-anchor="middle" class="label">Network security group</text>
+  <text x="1030" y="367" text-anchor="middle" class="small">PLS traffic + LB probe</text>
+
+  <rect x="920" y="405" width="220" height="72" rx="8" class="network"/>
+  <text x="1030" y="433" text-anchor="middle" class="label">Network interface</text>
+  <text x="1030" y="454" text-anchor="middle" class="detail">10.20.1.4 | IP forwarding</text>
+
+  <rect x="920" y="500" width="220" height="105" rx="8" class="compute" filter="url(#shadow)"/>
+  <text x="1030" y="531" text-anchor="middle" class="label">Ubuntu 22.04 VM</text>
+  <text x="1030" y="554" text-anchor="middle" class="detail">{prefix}-forwarder-vm</text>
+  <text x="1030" y="578" text-anchor="middle" class="small">systemd + iptables</text>
+  <text x="1030" y="596" text-anchor="middle" class="small">DNAT + MASQUERADE</text>
+
+  <path d="M240 365 L380 398" class="arrow"/>
+  <text x="295" y="345" class="flow">Private Link</text>
+  <path d="M560 408 L650 408" class="arrow"/>
+  <text x="572" y="391" class="flow">Frontend</text>
+  <path d="M830 408 L920 438" class="arrow"/>
+  <text x="838" y="391" class="flow">Backend pool</text>
+  <path d="M1030 477 L1030 500" class="arrow"/>
+  <path d="M920 351 L875 351 L875 441 L920 441" class="association"/>
+  <text x="866" y="397" text-anchor="end" class="small">attached</text>
+
+  <rect x="1255" y="135" width="235" height="510" rx="8" class="external"/>
+  <text x="1275" y="170" class="section">Customer managed</text>
+  <text x="1275" y="194" class="small">Not deployed by this template</text>
+
+  <rect x="1280" y="270" width="185" height="110" rx="8" class="customer"/>
+  <text x="1373" y="305" text-anchor="middle" class="label">VNet peering</text>
+  <text x="1373" y="329" text-anchor="middle" class="detail">Hub / spoke connectivity</text>
+  <text x="1373" y="352" text-anchor="middle" class="small">Optional UDR to firewall/NVA</text>
+
+  <rect x="1280" y="450" width="185" height="105" rx="8" class="customer" filter="url(#shadow)"/>
+  <text x="1373" y="484" text-anchor="middle" class="label">Private target</text>
+  <text x="1373" y="509" text-anchor="middle" class="detail">targetPrivateIp</text>
+  <text x="1373" y="532" text-anchor="middle" class="detail">targetPort</text>
+
+  <path d="M1140 552 L1215 552 L1215 325 L1280 325" class="customer-arrow"/>
+  <text x="1178" y="535" class="flow">Forwarded traffic</text>
+  <path d="M1373 380 L1373 450" class="customer-arrow"/>
+
+  <rect x="295" y="765" width="930" height="62" rx="8" fill="#fff4ce" stroke="#ca5010" stroke-width="2"/>
+  <text x="320" y="791" class="label">Important boundary</text>
+  <text x="320" y="815" class="detail">The template does not deploy the managed private endpoint, VNet peering, route table, firewall/NVA, or destination service.</text>
+
+  <line x1="40" y1="790" x2="90" y2="790" class="arrow"/>
+  <text x="102" y="795" class="small">Deployed traffic path</text>
+  <line x1="40" y1="820" x2="90" y2="820" class="customer-arrow"/>
+  <text x="102" y="825" class="small">Customer-owned connectivity</text>
+</svg>
