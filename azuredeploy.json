@@ -1,0 +1,429 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Deploys a standalone VNet with a Private Link Service, Standard internal load balancer, and a Linux forwarding appliance for Fabric or Azure Data Factory managed private endpoint connectivity."
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for all resources."
+      }
+    },
+    "prefix": {
+      "type": "string",
+      "defaultValue": "pls-lab",
+      "minLength": 3,
+      "maxLength": 20,
+      "metadata": {
+        "description": "Lowercase prefix used in resource names."
+      }
+    },
+    "vnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.20.0.0/16"
+    },
+    "natBackendSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.20.1.0/24"
+    },
+    "loadBalancerSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.20.2.0/24"
+    },
+    "privateLinkServiceNatSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.20.3.0/24"
+    },
+    "forwardingVmPrivateIp": {
+      "type": "string",
+      "defaultValue": "10.20.1.4"
+    },
+    "loadBalancerPrivateIp": {
+      "type": "string",
+      "defaultValue": "10.20.2.4"
+    },
+    "privateLinkServiceNatIp": {
+      "type": "string",
+      "defaultValue": "10.20.3.4"
+    },
+    "targetPrivateIp": {
+      "type": "string",
+      "metadata": {
+        "description": "Private IPv4 address reached through hub/spoke peering. The forwarding VM DNATs incoming traffic to this address."
+      }
+    },
+    "targetPort": {
+      "type": "int",
+      "defaultValue": 8080,
+      "minValue": 1,
+      "maxValue": 65535
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "labadmin"
+    },
+    "adminSshPublicKey": {
+      "type": "secureString",
+      "metadata": {
+        "description": "SSH public key for the private forwarding VM. No public IP is created."
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_B1ms"
+    },
+    "consumerSubscriptionIds": {
+      "type": "array",
+      "defaultValue": "[createArray(subscription().subscriptionId)]",
+      "metadata": {
+        "description": "Subscriptions allowed to discover this Private Link Service. Add the subscription containing the Fabric or ADF managed VNet."
+      }
+    },
+    "autoApprovalSubscriptionIds": {
+      "type": "array",
+      "defaultValue": "[createArray(subscription().subscriptionId)]",
+      "metadata": {
+        "description": "Consumer subscriptions whose private endpoint requests are approved automatically. Use an empty array to require manual approval."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {
+        "environment": "lab",
+        "workload": "private-link-forwarding-appliance"
+      }
+    }
+  },
+  "variables": {
+    "vnetName": "[format('{0}-vnet', parameters('prefix'))]",
+    "nsgName": "[format('{0}-forwarder-nsg', parameters('prefix'))]",
+    "nicName": "[format('{0}-forwarder-nic', parameters('prefix'))]",
+    "vmName": "[format('{0}-forwarder-vm', parameters('prefix'))]",
+    "lbName": "[format('{0}-internal-lb', parameters('prefix'))]",
+    "plsName": "[format('{0}-pls', parameters('prefix'))]",
+    "backendSubnetName": "forwarder-subnet",
+    "lbSubnetName": "load-balancer-subnet",
+    "plsNatSubnetName": "private-link-service-nat-subnet",
+    "lbFrontendName": "PrivateLinkFrontEnd",
+    "lbBackendPoolName": "forwarderBackendPool",
+    "lbProbeName": "target-port-health",
+    "lbRuleName": "[format('forward-{0}', parameters('targetPort'))]",
+    "cloudInitTemplate": "#cloud-config\nwrite_files:\n  - path: /etc/sysctl.d/99-private-link-forwarder.conf\n    permissions: '0644'\n    content: |\n      net.ipv4.ip_forward=1\n  - path: /usr/local/sbin/configure-private-link-forwarder.sh\n    permissions: '0755'\n    content: |\n      #!/usr/bin/env bash\n      set -euo pipefail\n      iptables -t nat -C PREROUTING -i eth0 -p tcp --dport {1} -j DNAT --to-destination {0}:{1} 2>/dev/null || iptables -t nat -A PREROUTING -i eth0 -p tcp --dport {1} -j DNAT --to-destination {0}:{1}\n      iptables -t nat -C POSTROUTING -p tcp -d {0} --dport {1} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -p tcp -d {0} --dport {1} -j MASQUERADE\n      iptables -C FORWARD -p tcp -d {0} --dport {1} -j ACCEPT 2>/dev/null || iptables -A FORWARD -p tcp -d {0} --dport {1} -j ACCEPT\n      iptables -C FORWARD -p tcp -s {0} --sport {1} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -p tcp -s {0} --sport {1} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n  - path: /etc/systemd/system/private-link-forwarder.service\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Private Link forwarding rules\n      After=network-online.target\n      Wants=network-online.target\n      [Service]\n      Type=oneshot\n      ExecStart=/usr/local/sbin/configure-private-link-forwarder.sh\n      RemainAfterExit=yes\n      [Install]\n      WantedBy=multi-user.target\nruncmd:\n  - [sysctl, --system]\n  - [systemctl, daemon-reload]\n  - [systemctl, enable, --now, private-link-forwarder.service]\nfinal_message: 'Private Link forwarding is configured.'\n"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2023-11-01",
+      "name": "[variables('vnetName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "[parameters('vnetAddressPrefix')]"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "[variables('backendSubnetName')]",
+            "properties": {
+              "addressPrefix": "[parameters('natBackendSubnetPrefix')]"
+            }
+          },
+          {
+            "name": "[variables('lbSubnetName')]",
+            "properties": {
+              "addressPrefix": "[parameters('loadBalancerSubnetPrefix')]"
+            }
+          },
+          {
+            "name": "[variables('plsNatSubnetName')]",
+            "properties": {
+              "addressPrefix": "[parameters('privateLinkServiceNatSubnetPrefix')]",
+              "privateLinkServiceNetworkPolicies": "Disabled"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-11-01",
+      "name": "[variables('nsgName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "Allow-PrivateLink-Service-Traffic",
+            "properties": {
+              "priority": 100,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "[string(parameters('targetPort'))]",
+              "sourceAddressPrefix": "[parameters('privateLinkServiceNatSubnetPrefix')]",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "Allow-Load-Balancer-Probe",
+            "properties": {
+              "priority": 110,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "[string(parameters('targetPort'))]",
+              "sourceAddressPrefix": "AzureLoadBalancer",
+              "destinationAddressPrefix": "*"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/loadBalancers",
+      "apiVersion": "2023-11-01",
+      "name": "[variables('lbName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Regional"
+      },
+      "tags": "[parameters('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+      ],
+      "properties": {
+        "frontendIPConfigurations": [
+          {
+            "name": "[variables('lbFrontendName')]",
+            "properties": {
+              "privateIPAddress": "[parameters('loadBalancerPrivateIp')]",
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddressVersion": "IPv4",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('lbSubnetName'))]"
+              }
+            }
+          }
+        ],
+        "backendAddressPools": [
+          {
+            "name": "[variables('lbBackendPoolName')]"
+          }
+        ],
+        "probes": [
+          {
+            "name": "[variables('lbProbeName')]",
+            "properties": {
+              "protocol": "Tcp",
+              "port": "[parameters('targetPort')]",
+              "intervalInSeconds": 15,
+              "numberOfProbes": 2
+            }
+          }
+        ],
+        "loadBalancingRules": [
+          {
+            "name": "[variables('lbRuleName')]",
+            "properties": {
+              "protocol": "Tcp",
+              "frontendPort": "[parameters('targetPort')]",
+              "backendPort": "[parameters('targetPort')]",
+              "idleTimeoutInMinutes": 15,
+              "enableFloatingIP": false,
+              "disableOutboundSnat": true,
+              "frontendIPConfiguration": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('lbName'), variables('lbFrontendName'))]"
+              },
+              "backendAddressPool": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('lbName'), variables('lbBackendPoolName'))]"
+              },
+              "probe": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/probes', variables('lbName'), variables('lbProbeName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-11-01",
+      "name": "[variables('nicName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]",
+        "[resourceId('Microsoft.Network/loadBalancers', variables('lbName'))]"
+      ],
+      "properties": {
+        "enableIPForwarding": true,
+        "networkSecurityGroup": {
+          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+        },
+        "ipConfigurations": [
+          {
+            "name": "primary",
+            "properties": {
+              "privateIPAddress": "[parameters('forwardingVmPrivateIp')]",
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddressVersion": "IPv4",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('backendSubnetName'))]"
+              },
+              "loadBalancerBackendAddressPools": [
+                {
+                  "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('lbName'), variables('lbBackendPoolName'))]"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('vmName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[variables('vmName')]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "customData": "[base64(format(variables('cloudInitTemplate'), parameters('targetPrivateIp'), parameters('targetPort')))]",
+          "linuxConfiguration": {
+            "disablePasswordAuthentication": true,
+            "ssh": {
+              "publicKeys": [
+                {
+                  "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+                  "keyData": "[parameters('adminSshPublicKey')]"
+                }
+              ]
+            }
+          }
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "Canonical",
+            "offer": "0001-com-ubuntu-server-jammy",
+            "sku": "22_04-lts-gen2",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "caching": "ReadWrite",
+            "managedDisk": {
+              "storageAccountType": "Standard_LRS"
+            },
+            "diskSizeGB": 30,
+            "deleteOption": "Delete"
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]",
+              "properties": {
+                "deleteOption": "Delete"
+              }
+            }
+          ]
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": true
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/privateLinkServices",
+      "apiVersion": "2023-11-01",
+      "name": "[variables('plsName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/loadBalancers', variables('lbName'))]",
+        "[resourceId('Microsoft.Compute/virtualMachines', variables('vmName'))]"
+      ],
+      "properties": {
+        "loadBalancerFrontendIpConfigurations": [
+          {
+            "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('lbName'), variables('lbFrontendName'))]"
+          }
+        ],
+        "ipConfigurations": [
+          {
+            "name": "primary",
+            "properties": {
+              "privateIPAddress": "[parameters('privateLinkServiceNatIp')]",
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddressVersion": "IPv4",
+              "primary": true,
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('plsNatSubnetName'))]"
+              }
+            }
+          }
+        ],
+        "visibility": {
+          "subscriptions": "[parameters('consumerSubscriptionIds')]"
+        },
+        "autoApproval": {
+          "subscriptions": "[parameters('autoApprovalSubscriptionIds')]"
+        },
+        "enableProxyProtocol": false
+      }
+    }
+  ],
+  "outputs": {
+    "virtualNetworkId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+    },
+    "virtualNetworkName": {
+      "type": "string",
+      "value": "[variables('vnetName')]"
+    },
+    "privateLinkServiceId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/privateLinkServices', variables('plsName'))]"
+    },
+    "privateLinkServiceAlias": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Network/privateLinkServices', variables('plsName')), '2023-11-01').alias]"
+    },
+    "loadBalancerPrivateIp": {
+      "type": "string",
+      "value": "[parameters('loadBalancerPrivateIp')]"
+    },
+    "forwardingVmName": {
+      "type": "string",
+      "value": "[variables('vmName')]"
+    },
+    "forwardingVmPrivateIp": {
+      "type": "string",
+      "value": "[parameters('forwardingVmPrivateIp')]"
+    },
+    "target": {
+      "type": "string",
+      "value": "[format('{0}:{1}', parameters('targetPrivateIp'), parameters('targetPort'))]"
+    }
+  }
+}
