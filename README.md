@@ -1,6 +1,6 @@
 # Private Link forwarding appliance ARM template
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FAzureGovGuy%2Farm-vnet2-pls-appliance%2Fmain%2Fazuredeploy.json)
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FAzureGovGuy%2Farm-pls-appliance%2Fmain%2Fazuredeploy.json)
 
 This resource-group-scoped ARM template deploys the provider side of a Private Link connection:
 
