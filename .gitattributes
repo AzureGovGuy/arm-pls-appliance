@@ -1,0 +1,13 @@
+# Shell scripts and cloud-init are consumed by Linux. A CRLF checkout breaks them:
+# bash reports "$'\r': command not found", and cloud-init silently mis-parses the YAML.
+*.sh            text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+
+# The template embeds cloud-init/forwarder.yaml verbatim, so its line endings must be
+# stable for tools/Build-Template.ps1 -Verify to be meaningful across platforms.
+azuredeploy.json text eol=lf
+
+*.ps1           text eol=crlf
+*.md            text
+*.svg           text eol=lf
