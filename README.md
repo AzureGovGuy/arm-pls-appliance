@@ -158,6 +158,7 @@ Scale set instances take **dynamic** addresses, so there is no stable per-instan
 
 ## Operational notes
 
+- **Bring the target up before enabling automatic repairs.** The health endpoint reports Unhealthy until a configured target accepts TCP, so `enableAutomaticRepairs` with an unreachable target replaces every instance once the 30-minute grace period expires — and each replacement is unhealthy for the same reason, so it repeats. Deploy with `-EnableAutomaticRepairs:$false` during a staged bring-up and turn it on once the path works end to end.
 - No public IP is assigned to the instances. Admin access must come through the customer's private network, Azure Run Command, or by setting `adminSourceAddressPrefix` to a private CIDR.
 - The load-balancer probe reaches the configured target port through a forwarding instance. A failed downstream target makes the backend unhealthy, which is intended.
 - Linux rules are recreated at every boot by `private-link-forwarder.service` and reconciled every five minutes by `private-link-forwarder-reconcile.timer`.

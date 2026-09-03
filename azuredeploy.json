@@ -212,7 +212,7 @@
           "destinationPortRange": "[string(parameters('targetPort'))]",
           "sourceAddressPrefix": "AzureLoadBalancer",
           "destinationAddressPrefix": "*",
-          "description": "Health probes from 168.63.129.16. These are DNAT'd to the target like real traffic, so the probe tests the whole path rather than instance liveness."
+          "description": "Health probes from 168.63.129.16. DNAT'd to the target like real traffic, so this tests the whole path, not liveness."
         }
       },
       {

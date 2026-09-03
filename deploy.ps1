@@ -24,6 +24,11 @@ param(
     # Optional private CIDR allowed to reach SSH. No rule is created when omitted.
     [string] $AdminSourceAddressPrefix = "",
 
+    # Set false for a staged bring-up. The health endpoint reports Unhealthy until the target
+    # accepts TCP, so enabling repairs before the target exists replaces every instance once the
+    # grace period expires, and each replacement is unhealthy for the same reason.
+    [bool] $EnableAutomaticRepairs = $true,
+
     [string[]] $ConsumerSubscriptionIds = @((az account show --query id -o tsv)),
     [switch] $AutoApproveConsumers,
 
@@ -71,6 +76,7 @@ $deploymentArgs = @(
     "instanceCount=$InstanceCount",
     "vmSize=$VmSize",
     "enableInternetEgress=$($EnableInternetEgress.IsPresent.ToString().ToLower())",
+    "enableAutomaticRepairs=$($EnableAutomaticRepairs.ToString().ToLower())",
     "adminSourceAddressPrefix=$AdminSourceAddressPrefix",
     "availabilityZones=$availabilityZonesJson",
     "consumerSubscriptionIds=$consumerSubscriptionIdsJson",
