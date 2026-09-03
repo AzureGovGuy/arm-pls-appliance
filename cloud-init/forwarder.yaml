@@ -1,0 +1,309 @@
+#cloud-config
+# Private Link forwarding appliance — VMSS instance bootstrap.
+#
+# This file is the single source of truth for instance configuration. `tools/Build-Template.ps1`
+# embeds it into the `cloudInitTemplate` variable in azuredeploy.json and ARM substitutes the two
+# placeholders below at deploy time, so the template stays self-contained and portal-deployable
+# while this file remains reviewable as real YAML. Run the build script after editing; deploy.ps1
+# refuses to deploy a template whose embedded copy has drifted from this file.
+#
+#   __FORWARD_MAP__   newline-separated "listenPort targetHost targetPort" records
+#   __HEALTH_PORT__   loopback TCP port serving the health endpoint for the Application Health extension
+#
+# Two constraints shape everything here:
+#
+#   1. No package installation. iptables, systemd and bash all ship in the Azure Ubuntu
+#      marketplace image. VMSS instances in Flexible orchestration have no default outbound
+#      internet access, and platform default outbound access retired in September 2025, so a
+#      cloud-init that runs `apt install` hangs for the whole boot in a locked-down subnet.
+#      Everything below works with zero egress.
+#
+#   2. Convergence, not first-boot setup. iptables rules live in the kernel and are lost on
+#      every reboot. Nothing here writes rules once; a systemd unit rebuilds them at boot and a
+#      timer reconciles drift, so reboot, platform patching, reimage and scale-out all land on
+#      identical state.
+
+package_update: false
+package_upgrade: false
+
+write_files:
+  # nf_conntrack must be resident before systemd-sysctl applies the tunables below, otherwise
+  # net.netfilter.* keys do not exist yet and are silently skipped at early boot.
+  - path: /etc/modules-load.d/private-link-forwarder.conf
+    permissions: '0644'
+    content: |
+      nf_conntrack
+
+  - path: /etc/sysctl.d/99-private-link-forwarder.conf
+    permissions: '0644'
+    content: |
+      # The Azure NIC has enableIPForwarding=true; this is the matching guest-side half.
+      # Both are required — either one alone silently blackholes forwarded traffic.
+      net.ipv4.ip_forward = 1
+
+      # Loose reverse-path filtering. Return traffic from on-premises can arrive on a path the
+      # strict check does not consider symmetric once a hub firewall or UDR is inserted.
+      net.ipv4.conf.all.rp_filter = 2
+      net.ipv4.conf.default.rp_filter = 2
+
+      # MASQUERADE burns one source port per concurrent flow toward the same target tuple.
+      # Spark with a high JDBC numPartitions opens many parallel connections, so the ephemeral
+      # range and the conntrack ceiling are the real scale limits on this appliance — not CPU.
+      net.ipv4.ip_local_port_range = 10000 65000
+      net.netfilter.nf_conntrack_max = 262144
+
+      # Detect a dead peer well inside the Private Link service's ~5 minute idle timeout so
+      # conntrack entries for reset flows are reclaimed promptly.
+      net.ipv4.tcp_keepalive_time = 120
+      net.ipv4.tcp_keepalive_intvl = 30
+      net.ipv4.tcp_keepalive_probes = 4
+
+  - path: /etc/private-link-forwarder/forward.map
+    permissions: '0644'
+    content: |
+      # listenPort targetHost targetPort
+      __FORWARD_MAP__
+
+  - path: /usr/local/sbin/private-link-forwarder
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # Builds the DNAT/SNAT/forward rules for the Private Link forwarding appliance.
+      #
+      # All rules live in dedicated PLS_FORWARDER chains rather than in the built-in chains.
+      # That makes `apply` a full rebuild that is idempotent and atomic enough to re-run at any
+      # time, and makes `flush` able to remove everything this appliance owns without disturbing
+      # rules added by any other agent on the host.
+      set -euo pipefail
+
+      CHAIN=PLS_FORWARDER
+      MAP=/etc/private-link-forwarder/forward.map
+
+      # Derive the uplink instead of hardcoding eth0. Accelerated networking on D-series adds a
+      # bound VF interface, and a second NIC would shift the name — a wrong -i match here fails
+      # open as "no forwarding at all", which is the hardest symptom to diagnose.
+      uplink() {
+        local dev=''
+        dev="$( (ip -4 route show default 2>/dev/null || true) | awk '{print $5; exit}' )" || true
+        printf '%s' "${dev:-eth0}"
+      }
+
+      # Emit each mapping as "listenPort targetHost targetPort", skipping comments and blanks.
+      mappings() {
+        [ -r "$MAP" ] || return 0
+        while read -r listen host port _rest; do
+          case "${listen:-}" in ''|\#*) continue ;; esac
+          [ -n "${host:-}" ] && [ -n "${port:-}" ] || continue
+          printf '%s %s %s\n' "$listen" "$host" "$port"
+        done < "$MAP"
+      }
+
+      ensure_chain() {
+        local table="$1" parent="$2"
+        iptables -t "$table" -N "$CHAIN" 2>/dev/null || iptables -t "$table" -F "$CHAIN"
+        iptables -t "$table" -C "$parent" -j "$CHAIN" 2>/dev/null \
+          || iptables -t "$table" -I "$parent" 1 -j "$CHAIN"
+      }
+
+      apply() {
+        local dev
+        dev="$(uplink)"
+
+        ensure_chain nat PREROUTING
+        ensure_chain nat POSTROUTING
+        ensure_chain filter FORWARD
+
+        while read -r listen host port; do
+          # Inbound from the load balancer: rewrite the destination to the real target.
+          iptables -t nat -A "$CHAIN" -i "$dev" -p tcp --dport "$listen" \
+            -j DNAT --to-destination "$host:$port"
+          # Outbound to the target: rewrite the source to this instance, so the target needs a
+          # return route only to this VNet rather than to the Fabric managed VNet.
+          iptables -t nat -A "$CHAIN" -p tcp -d "$host" --dport "$port" -j MASQUERADE
+          iptables -A "$CHAIN" -p tcp -d "$host" --dport "$port" -j ACCEPT
+        done < <(mappings)
+
+        # Return traffic for every mapping, in one rule rather than one per target.
+        iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      }
+
+      flush() {
+        local pair table parent
+        for pair in nat:PREROUTING nat:POSTROUTING filter:FORWARD; do
+          table="${pair%%:*}"
+          parent="${pair##*:}"
+          # Loop: a repeated apply/upgrade could have left more than one jump in place.
+          while iptables -t "$table" -C "$parent" -j "$CHAIN" 2>/dev/null; do
+            iptables -t "$table" -D "$parent" -j "$CHAIN"
+          done
+        done
+        for table in nat filter; do
+          iptables -t "$table" -F "$CHAIN" 2>/dev/null || true
+          iptables -t "$table" -X "$CHAIN" 2>/dev/null || true
+        done
+      }
+
+      # Exit 0 only when every rule this appliance owns is present. Used by the reconcile timer
+      # and by the health endpoint, so it must be cheap and must never mutate state.
+      verify() {
+        local dev found=0
+        dev="$(uplink)"
+
+        iptables -t nat -C PREROUTING -j "$CHAIN" 2>/dev/null || return 1
+        iptables -t nat -C POSTROUTING -j "$CHAIN" 2>/dev/null || return 1
+        iptables -C FORWARD -j "$CHAIN" 2>/dev/null || return 1
+
+        while read -r listen host port; do
+          found=1
+          iptables -t nat -C "$CHAIN" -i "$dev" -p tcp --dport "$listen" \
+            -j DNAT --to-destination "$host:$port" 2>/dev/null || return 1
+          iptables -t nat -C "$CHAIN" -p tcp -d "$host" --dport "$port" -j MASQUERADE 2>/dev/null || return 1
+        done < <(mappings)
+
+        # An empty map means the appliance is unconfigured, which is a failure, not a pass.
+        [ "$found" -eq 1 ] || return 1
+        [ "$(cat /proc/sys/net/ipv4/ip_forward)" = "1" ] || return 1
+        return 0
+      }
+
+      case "${1:-apply}" in
+        apply)     apply ;;
+        flush)     flush ;;
+        verify)    verify ;;
+        # Self-healing: repair drift only when there is drift, so the steady state never tears
+        # down live rules and no in-flight SYN can miss the DNAT during a rebuild window.
+        reconcile) verify || { flush; apply; } ;;
+        status)
+          iptables -t nat -L "$CHAIN" -n -v --line-numbers
+          iptables -L "$CHAIN" -n -v --line-numbers
+          ;;
+        *) echo "usage: ${0##*/} {apply|flush|verify|reconcile|status}" >&2; exit 64 ;;
+      esac
+
+  - path: /usr/local/sbin/private-link-healthcheck
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # Socket-activated health responder for the Azure Application Health extension.
+      #
+      # It answers two independent questions, because either failing alone produces a silently
+      # broken appliance that a liveness-only probe (Learn's tutorial probes port 22) reports as
+      # healthy:
+      #
+      #   1. Are the forwarding rules actually installed right now?
+      #   2. Is at least one configured target actually accepting TCP right now?
+      #
+      # Note that (2) is a locally originated connection, so it traverses OUTPUT and does not
+      # exercise the DNAT rules — which is exactly why (1) is checked separately rather than
+      # assumed. Together they cover the full path.
+      #
+      # No `set -e`: a probe that opens the socket and stalls must produce a response, not an
+      # unhandled exit.
+
+      MAP=/etc/private-link-forwarder/forward.map
+
+      # Drain the HTTP request. The content is irrelevant; the timeouts guard against a stalled
+      # or half-open probe holding the socket-activated instance open.
+      read -r -t 2 _ || true
+      while IFS= read -r -t 1 line; do
+        [ -z "${line%$'\r'}" ] && break
+      done
+
+      state="Healthy"
+
+      /usr/local/sbin/private-link-forwarder verify >/dev/null 2>&1 || state="Unhealthy"
+
+      if [ "$state" = "Healthy" ]; then
+        reachable=0
+        while read -r listen host port _rest; do
+          case "${listen:-}" in ''|\#*) continue ;; esac
+          [ -n "${host:-}" ] && [ -n "${port:-}" ] || continue
+          if timeout 3 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+            reachable=1
+            break
+          fi
+        done < "$MAP"
+        [ "$reachable" -eq 1 ] || state="Unhealthy"
+      fi
+
+      # Rich Health States contract: always answer 2xx and carry the verdict in the body. A
+      # non-2xx is interpreted as "Unknown", which loses the distinction between "the app says
+      # it is unhealthy" and "the probe could not reach the app at all".
+      body="{\"ApplicationHealthState\":\"${state}\"}"
+      printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' \
+        "${#body}" "$body"
+
+  - path: /etc/systemd/system/private-link-forwarder.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Private Link forwarding appliance rules
+      Documentation=https://github.com/AzureGovGuy/arm-pls-appliance
+      Wants=network-online.target
+      After=network-online.target systemd-sysctl.service
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/private-link-forwarder apply
+      ExecReload=/usr/local/sbin/private-link-forwarder apply
+      ExecStop=/usr/local/sbin/private-link-forwarder flush
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/private-link-forwarder-reconcile.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Reconcile Private Link forwarding appliance rules
+      After=private-link-forwarder.service
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/private-link-forwarder reconcile
+
+  - path: /etc/systemd/system/private-link-forwarder-reconcile.timer
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Periodic drift check for Private Link forwarding rules
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=5min
+      AccuracySec=30s
+      [Install]
+      WantedBy=timers.target
+
+  - path: /etc/systemd/system/private-link-health.socket
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Private Link forwarding appliance health endpoint
+      [Socket]
+      # Loopback only. The Application Health extension runs on the instance and probes locally,
+      # so this endpoint never needs to be reachable from the VNet and never needs an NSG rule.
+      ListenStream=127.0.0.1:__HEALTH_PORT__
+      Accept=yes
+      [Install]
+      WantedBy=sockets.target
+
+  - path: /etc/systemd/system/private-link-health@.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Private Link forwarding appliance health responder
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/sbin/private-link-healthcheck
+      StandardInput=socket
+      StandardOutput=socket
+      StandardError=journal
+      TimeoutStartSec=15s
+
+runcmd:
+  - [modprobe, nf_conntrack]
+  - [sysctl, --system]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, private-link-forwarder.service]
+  - [systemctl, enable, --now, private-link-forwarder-reconcile.timer]
+  - [systemctl, enable, --now, private-link-health.socket]
+
+final_message: 'Private Link forwarding appliance ready after $UPTIME seconds.'

@@ -49,7 +49,7 @@
 
   <rect x="295" y="110" width="930" height="625" rx="8" class="resource-group"/>
   <text x="320" y="146" class="section">Deployed resource group</text>
-  <text x="1175" y="146" text-anchor="end" class="small">6 top-level ARM resources</text>
+  <text x="1175" y="146" text-anchor="end" class="small">5 core ARM resources + optional NAT gateway</text>
 
   <rect x="325" y="170" width="870" height="500" rx="8" class="vnet"/>
   <text x="350" y="204" class="section">Virtual network: {prefix}-vnet</text>
@@ -80,21 +80,23 @@
   <rect x="890" y="230" width="280" height="405" rx="8" class="subnet"/>
   <text x="910" y="260" class="label">Forwarder subnet</text>
   <text x="910" y="282" class="small">forwarder-subnet</text>
-  <text x="910" y="301" class="small">Default 10.20.1.0/24</text>
+  <text x="910" y="301" class="small">Default 10.20.1.0/27</text>
 
   <rect x="920" y="320" width="220" height="62" rx="8" class="security"/>
   <text x="1030" y="346" text-anchor="middle" class="label">Network security group</text>
   <text x="1030" y="367" text-anchor="middle" class="small">PLS traffic + LB probe</text>
 
   <rect x="920" y="405" width="220" height="72" rx="8" class="network"/>
-  <text x="1030" y="433" text-anchor="middle" class="label">Network interface</text>
-  <text x="1030" y="454" text-anchor="middle" class="detail">10.20.1.4 | IP forwarding</text>
+  <text x="1030" y="430" text-anchor="middle" class="label">NIC configuration</text>
+  <text x="1030" y="450" text-anchor="middle" class="detail">IP forwarding | accelerated</text>
+  <text x="1030" y="468" text-anchor="middle" class="small">Dynamic IPs from the subnet</text>
 
-  <rect x="920" y="500" width="220" height="105" rx="8" class="compute" filter="url(#shadow)"/>
-  <text x="1030" y="531" text-anchor="middle" class="label">Ubuntu 22.04 VM</text>
-  <text x="1030" y="554" text-anchor="middle" class="detail">{prefix}-forwarder-vm</text>
-  <text x="1030" y="578" text-anchor="middle" class="small">systemd + iptables</text>
-  <text x="1030" y="596" text-anchor="middle" class="small">DNAT + MASQUERADE</text>
+  <rect x="920" y="497" width="220" height="126" rx="8" class="compute" filter="url(#shadow)"/>
+  <text x="1030" y="524" text-anchor="middle" class="label">Ubuntu 22.04 scale set</text>
+  <text x="1030" y="546" text-anchor="middle" class="detail">{prefix}-forwarder-vmss</text>
+  <text x="1030" y="568" text-anchor="middle" class="small">Flexible | 2 x D2s_v5 | zones 1-3</text>
+  <text x="1030" y="586" text-anchor="middle" class="small">cloud-init + systemd | DNAT + SNAT</text>
+  <text x="1030" y="604" text-anchor="middle" class="small">Health extension + auto repair</text>
 
   <path d="M240 365 L380 398" class="arrow"/>
   <text x="295" y="345" class="flow">Private Link</text>

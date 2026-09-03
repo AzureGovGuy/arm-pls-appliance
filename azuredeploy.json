@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "1.0.0.0",
+  "contentVersion": "2.0.0.0",
   "metadata": {
-    "description": "Deploys a standalone VNet with a Private Link Service, Standard internal load balancer, and a Linux forwarding appliance for Fabric or Azure Data Factory managed private endpoint connectivity."
+    "description": "Deploys a standalone VNet with a Private Link Service, Standard internal load balancer, and a Flexible-orchestration virtual machine scale set of Linux forwarding appliances for Fabric or Azure Data Factory managed private endpoint connectivity.",
+    "cloudInitSource": "cloud-init/forwarder.yaml is the source of truth for the cloudInitTemplate variable. Run tools/Build-Template.ps1 after editing it, and tools/Build-Template.ps1 -Verify to confirm this file is in sync."
   },
   "parameters": {
     "location": {
@@ -25,9 +26,12 @@
       "type": "string",
       "defaultValue": "10.20.0.0/16"
     },
-    "natBackendSubnetPrefix": {
+    "forwarderSubnetPrefix": {
       "type": "string",
-      "defaultValue": "10.20.1.0/24"
+      "defaultValue": "10.20.1.0/27",
+      "metadata": {
+        "description": "Subnet holding the scale set. Scale set instances take dynamic addresses, so the target's firewall must allow this whole prefix. Keep it small: a /27 leaves 27 usable addresses and keeps the on-premises firewall change request narrow."
+      }
     },
     "loadBalancerSubnetPrefix": {
       "type": "string",
@@ -36,10 +40,6 @@
     "privateLinkServiceNatSubnetPrefix": {
       "type": "string",
       "defaultValue": "10.20.3.0/24"
-    },
-    "forwardingVmPrivateIp": {
-      "type": "string",
-      "defaultValue": "10.20.1.4"
     },
     "loadBalancerPrivateIp": {
       "type": "string",
@@ -68,12 +68,84 @@
     "adminSshPublicKey": {
       "type": "secureString",
       "metadata": {
-        "description": "SSH public key for the private forwarding VM. No public IP is created."
+        "description": "SSH public key for the forwarding instances. No public IP is created."
+      }
+    },
+    "adminSourceAddressPrefix": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional private CIDR allowed to reach SSH on the forwarding instances. Leave empty to create no SSH rule at all."
       }
     },
     "vmSize": {
       "type": "string",
-      "defaultValue": "Standard_B1ms"
+      "defaultValue": "Standard_D2s_v5",
+      "metadata": {
+        "description": "Instance size. D-series supports accelerated networking, which B-series does not; the appliance is packet-forwarding bound, so the NIC path matters far more than vCPU count."
+      }
+    },
+    "instanceCount": {
+      "type": "int",
+      "defaultValue": 2,
+      "minValue": 1,
+      "maxValue": 20,
+      "metadata": {
+        "description": "Number of forwarding instances. Autoscale is deliberately not configured: scale-in kills in-flight TCP sessions because Azure Load Balancer does not drain connections."
+      }
+    },
+    "availabilityZones": {
+      "type": "array",
+      "defaultValue": [
+        "1",
+        "2",
+        "3"
+      ],
+      "metadata": {
+        "description": "Zones to spread instances across. Use an empty array in regions without availability zones."
+      }
+    },
+    "enableAcceleratedNetworking": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Requires a VM size that supports it. Set false if vmSize is changed to a size without accelerated networking support."
+      }
+    },
+    "enableInternetEgress": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Creates a NAT gateway for outbound internet from the forwarder subnet. Not required for the data path, for this template's cloud-init, or for extension installation, because a supported Azure Linux Agent downloads extension packages through the fabric controller on 168.63.129.16. Enable it only to allow in-guest OS patching or to install extra packages."
+      }
+    },
+    "enableAutomaticRepairs": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Replaces instances the Application Health extension reports unhealthy."
+      }
+    },
+    "healthPort": {
+      "type": "int",
+      "defaultValue": 8080,
+      "minValue": 1,
+      "maxValue": 65535,
+      "metadata": {
+        "description": "Loopback port for the health endpoint the Application Health extension probes. Never exposed to the VNet, so it needs no NSG rule."
+      }
+    },
+    "imageReference": {
+      "type": "object",
+      "defaultValue": {
+        "publisher": "Canonical",
+        "offer": "0001-com-ubuntu-server-jammy",
+        "sku": "22_04-lts-gen2",
+        "version": "latest"
+      },
+      "metadata": {
+        "description": "Must be a generation 2 image because the instances use trusted launch."
+      }
     },
     "consumerSubscriptionIds": {
       "type": "array",
@@ -100,26 +172,144 @@
   "variables": {
     "vnetName": "[format('{0}-vnet', parameters('prefix'))]",
     "nsgName": "[format('{0}-forwarder-nsg', parameters('prefix'))]",
-    "nicName": "[format('{0}-forwarder-nic', parameters('prefix'))]",
-    "vmName": "[format('{0}-forwarder-vm', parameters('prefix'))]",
+    "vmssName": "[format('{0}-forwarder-vmss', parameters('prefix'))]",
+    "nicConfigName": "[format('{0}-forwarder-nic', parameters('prefix'))]",
     "lbName": "[format('{0}-internal-lb', parameters('prefix'))]",
     "plsName": "[format('{0}-pls', parameters('prefix'))]",
-    "backendSubnetName": "forwarder-subnet",
+    "natGatewayName": "[format('{0}-forwarder-natgw', parameters('prefix'))]",
+    "natGatewayIpName": "[format('{0}-forwarder-natgw-pip', parameters('prefix'))]",
+    "forwarderSubnetName": "forwarder-subnet",
     "lbSubnetName": "load-balancer-subnet",
     "plsNatSubnetName": "private-link-service-nat-subnet",
     "lbFrontendName": "PrivateLinkFrontEnd",
     "lbBackendPoolName": "forwarderBackendPool",
     "lbProbeName": "target-port-health",
     "lbRuleName": "[format('forward-{0}', parameters('targetPort'))]",
-    "cloudInitTemplate": "#cloud-config\nwrite_files:\n  - path: /etc/sysctl.d/99-private-link-forwarder.conf\n    permissions: '0644'\n    content: |\n      net.ipv4.ip_forward=1\n  - path: /usr/local/sbin/configure-private-link-forwarder.sh\n    permissions: '0755'\n    content: |\n      #!/usr/bin/env bash\n      set -euo pipefail\n      iptables -t nat -C PREROUTING -i eth0 -p tcp --dport {1} -j DNAT --to-destination {0}:{1} 2>/dev/null || iptables -t nat -A PREROUTING -i eth0 -p tcp --dport {1} -j DNAT --to-destination {0}:{1}\n      iptables -t nat -C POSTROUTING -p tcp -d {0} --dport {1} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -p tcp -d {0} --dport {1} -j MASQUERADE\n      iptables -C FORWARD -p tcp -d {0} --dport {1} -j ACCEPT 2>/dev/null || iptables -A FORWARD -p tcp -d {0} --dport {1} -j ACCEPT\n      iptables -C FORWARD -p tcp -s {0} --sport {1} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -p tcp -s {0} --sport {1} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n  - path: /etc/systemd/system/private-link-forwarder.service\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Private Link forwarding rules\n      After=network-online.target\n      Wants=network-online.target\n      [Service]\n      Type=oneshot\n      ExecStart=/usr/local/sbin/configure-private-link-forwarder.sh\n      RemainAfterExit=yes\n      [Install]\n      WantedBy=multi-user.target\nruncmd:\n  - [sysctl, --system]\n  - [systemctl, daemon-reload]\n  - [systemctl, enable, --now, private-link-forwarder.service]\nfinal_message: 'Private Link forwarding is configured.'\n"
+    "computerNamePrefix": "[take(replace(parameters('prefix'), '-', ''), 9)]",
+    "baseSecurityRules": [
+      {
+        "name": "Allow-PrivateLink-Service-Traffic",
+        "properties": {
+          "priority": 100,
+          "direction": "Inbound",
+          "access": "Allow",
+          "protocol": "Tcp",
+          "sourcePortRange": "*",
+          "destinationPortRange": "[string(parameters('targetPort'))]",
+          "sourceAddressPrefix": "[parameters('privateLinkServiceNatSubnetPrefix')]",
+          "destinationAddressPrefix": "*",
+          "description": "Traffic arriving from the Private Link Service NAT subnet."
+        }
+      },
+      {
+        "name": "Allow-Load-Balancer-Probe",
+        "properties": {
+          "priority": 110,
+          "direction": "Inbound",
+          "access": "Allow",
+          "protocol": "Tcp",
+          "sourcePortRange": "*",
+          "destinationPortRange": "[string(parameters('targetPort'))]",
+          "sourceAddressPrefix": "AzureLoadBalancer",
+          "destinationAddressPrefix": "*",
+          "description": "Health probes from 168.63.129.16. These are DNAT'd to the target like real traffic, so the probe tests the whole path rather than instance liveness."
+        }
+      },
+      {
+        "name": "Deny-All-Inbound",
+        "properties": {
+          "priority": 4096,
+          "direction": "Inbound",
+          "access": "Deny",
+          "protocol": "*",
+          "sourcePortRange": "*",
+          "destinationPortRange": "*",
+          "sourceAddressPrefix": "*",
+          "destinationAddressPrefix": "*",
+          "description": "Explicit floor so an added rule must be deliberate."
+        }
+      }
+    ],
+    "sshSecurityRule": [
+      {
+        "name": "Allow-Admin-SSH",
+        "properties": {
+          "priority": 120,
+          "direction": "Inbound",
+          "access": "Allow",
+          "protocol": "Tcp",
+          "sourcePortRange": "*",
+          "destinationPortRange": "22",
+          "sourceAddressPrefix": "[parameters('adminSourceAddressPrefix')]",
+          "destinationAddressPrefix": "*",
+          "description": "Optional administrative access from a private network."
+        }
+      }
+    ],
+    "securityRules": "[concat(variables('baseSecurityRules'), if(empty(parameters('adminSourceAddressPrefix')), createArray(), variables('sshSecurityRule')))]",
+    "forwardMapLine": "[format('{0} {1} {2}', string(parameters('targetPort')), parameters('targetSQLServer'), string(parameters('targetPort')))]",
+    "cloudInitTemplate": "#cloud-config\n# Private Link forwarding appliance — VMSS instance bootstrap.\n#\n# This file is the single source of truth for instance configuration. `tools/Build-Template.ps1`\n# embeds it into the `cloudInitTemplate` variable in azuredeploy.json and ARM substitutes the two\n# placeholders below at deploy time, so the template stays self-contained and portal-deployable\n# while this file remains reviewable as real YAML. Run the build script after editing; deploy.ps1\n# refuses to deploy a template whose embedded copy has drifted from this file.\n#\n#   __FORWARD_MAP__   newline-separated \"listenPort targetHost targetPort\" records\n#   __HEALTH_PORT__   loopback TCP port serving the health endpoint for the Application Health extension\n#\n# Two constraints shape everything here:\n#\n#   1. No package installation. iptables, systemd and bash all ship in the Azure Ubuntu\n#      marketplace image. VMSS instances in Flexible orchestration have no default outbound\n#      internet access, and platform default outbound access retired in September 2025, so a\n#      cloud-init that runs `apt install` hangs for the whole boot in a locked-down subnet.\n#      Everything below works with zero egress.\n#\n#   2. Convergence, not first-boot setup. iptables rules live in the kernel and are lost on\n#      every reboot. Nothing here writes rules once; a systemd unit rebuilds them at boot and a\n#      timer reconciles drift, so reboot, platform patching, reimage and scale-out all land on\n#      identical state.\n\npackage_update: false\npackage_upgrade: false\n\nwrite_files:\n  # nf_conntrack must be resident before systemd-sysctl applies the tunables below, otherwise\n  # net.netfilter.* keys do not exist yet and are silently skipped at early boot.\n  - path: /etc/modules-load.d/private-link-forwarder.conf\n    permissions: '0644'\n    content: |\n      nf_conntrack\n\n  - path: /etc/sysctl.d/99-private-link-forwarder.conf\n    permissions: '0644'\n    content: |\n      # The Azure NIC has enableIPForwarding=true; this is the matching guest-side half.\n      # Both are required — either one alone silently blackholes forwarded traffic.\n      net.ipv4.ip_forward = 1\n\n      # Loose reverse-path filtering. Return traffic from on-premises can arrive on a path the\n      # strict check does not consider symmetric once a hub firewall or UDR is inserted.\n      net.ipv4.conf.all.rp_filter = 2\n      net.ipv4.conf.default.rp_filter = 2\n\n      # MASQUERADE burns one source port per concurrent flow toward the same target tuple.\n      # Spark with a high JDBC numPartitions opens many parallel connections, so the ephemeral\n      # range and the conntrack ceiling are the real scale limits on this appliance — not CPU.\n      net.ipv4.ip_local_port_range = 10000 65000\n      net.netfilter.nf_conntrack_max = 262144\n\n      # Detect a dead peer well inside the Private Link service's ~5 minute idle timeout so\n      # conntrack entries for reset flows are reclaimed promptly.\n      net.ipv4.tcp_keepalive_time = 120\n      net.ipv4.tcp_keepalive_intvl = 30\n      net.ipv4.tcp_keepalive_probes = 4\n\n  - path: /etc/private-link-forwarder/forward.map\n    permissions: '0644'\n    content: |\n      # listenPort targetHost targetPort\n      __FORWARD_MAP__\n\n  - path: /usr/local/sbin/private-link-forwarder\n    permissions: '0755'\n    content: |\n      #!/usr/bin/env bash\n      # Builds the DNAT/SNAT/forward rules for the Private Link forwarding appliance.\n      #\n      # All rules live in dedicated PLS_FORWARDER chains rather than in the built-in chains.\n      # That makes `apply` a full rebuild that is idempotent and atomic enough to re-run at any\n      # time, and makes `flush` able to remove everything this appliance owns without disturbing\n      # rules added by any other agent on the host.\n      set -euo pipefail\n\n      CHAIN=PLS_FORWARDER\n      MAP=/etc/private-link-forwarder/forward.map\n\n      # Derive the uplink instead of hardcoding eth0. Accelerated networking on D-series adds a\n      # bound VF interface, and a second NIC would shift the name — a wrong -i match here fails\n      # open as \"no forwarding at all\", which is the hardest symptom to diagnose.\n      uplink() {\n        local dev=''\n        dev=\"$( (ip -4 route show default 2>/dev/null || true) | awk '{print $5; exit}' )\" || true\n        printf '%s' \"${dev:-eth0}\"\n      }\n\n      # Emit each mapping as \"listenPort targetHost targetPort\", skipping comments and blanks.\n      mappings() {\n        [ -r \"$MAP\" ] || return 0\n        while read -r listen host port _rest; do\n          case \"${listen:-}\" in ''|\\#*) continue ;; esac\n          [ -n \"${host:-}\" ] && [ -n \"${port:-}\" ] || continue\n          printf '%s %s %s\\n' \"$listen\" \"$host\" \"$port\"\n        done < \"$MAP\"\n      }\n\n      ensure_chain() {\n        local table=\"$1\" parent=\"$2\"\n        iptables -t \"$table\" -N \"$CHAIN\" 2>/dev/null || iptables -t \"$table\" -F \"$CHAIN\"\n        iptables -t \"$table\" -C \"$parent\" -j \"$CHAIN\" 2>/dev/null \\\n          || iptables -t \"$table\" -I \"$parent\" 1 -j \"$CHAIN\"\n      }\n\n      apply() {\n        local dev\n        dev=\"$(uplink)\"\n\n        ensure_chain nat PREROUTING\n        ensure_chain nat POSTROUTING\n        ensure_chain filter FORWARD\n\n        while read -r listen host port; do\n          # Inbound from the load balancer: rewrite the destination to the real target.\n          iptables -t nat -A \"$CHAIN\" -i \"$dev\" -p tcp --dport \"$listen\" \\\n            -j DNAT --to-destination \"$host:$port\"\n          # Outbound to the target: rewrite the source to this instance, so the target needs a\n          # return route only to this VNet rather than to the Fabric managed VNet.\n          iptables -t nat -A \"$CHAIN\" -p tcp -d \"$host\" --dport \"$port\" -j MASQUERADE\n          iptables -A \"$CHAIN\" -p tcp -d \"$host\" --dport \"$port\" -j ACCEPT\n        done < <(mappings)\n\n        # Return traffic for every mapping, in one rule rather than one per target.\n        iptables -A \"$CHAIN\" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n      }\n\n      flush() {\n        local pair table parent\n        for pair in nat:PREROUTING nat:POSTROUTING filter:FORWARD; do\n          table=\"${pair%%:*}\"\n          parent=\"${pair##*:}\"\n          # Loop: a repeated apply/upgrade could have left more than one jump in place.\n          while iptables -t \"$table\" -C \"$parent\" -j \"$CHAIN\" 2>/dev/null; do\n            iptables -t \"$table\" -D \"$parent\" -j \"$CHAIN\"\n          done\n        done\n        for table in nat filter; do\n          iptables -t \"$table\" -F \"$CHAIN\" 2>/dev/null || true\n          iptables -t \"$table\" -X \"$CHAIN\" 2>/dev/null || true\n        done\n      }\n\n      # Exit 0 only when every rule this appliance owns is present. Used by the reconcile timer\n      # and by the health endpoint, so it must be cheap and must never mutate state.\n      verify() {\n        local dev found=0\n        dev=\"$(uplink)\"\n\n        iptables -t nat -C PREROUTING -j \"$CHAIN\" 2>/dev/null || return 1\n        iptables -t nat -C POSTROUTING -j \"$CHAIN\" 2>/dev/null || return 1\n        iptables -C FORWARD -j \"$CHAIN\" 2>/dev/null || return 1\n\n        while read -r listen host port; do\n          found=1\n          iptables -t nat -C \"$CHAIN\" -i \"$dev\" -p tcp --dport \"$listen\" \\\n            -j DNAT --to-destination \"$host:$port\" 2>/dev/null || return 1\n          iptables -t nat -C \"$CHAIN\" -p tcp -d \"$host\" --dport \"$port\" -j MASQUERADE 2>/dev/null || return 1\n        done < <(mappings)\n\n        # An empty map means the appliance is unconfigured, which is a failure, not a pass.\n        [ \"$found\" -eq 1 ] || return 1\n        [ \"$(cat /proc/sys/net/ipv4/ip_forward)\" = \"1\" ] || return 1\n        return 0\n      }\n\n      case \"${1:-apply}\" in\n        apply)     apply ;;\n        flush)     flush ;;\n        verify)    verify ;;\n        # Self-healing: repair drift only when there is drift, so the steady state never tears\n        # down live rules and no in-flight SYN can miss the DNAT during a rebuild window.\n        reconcile) verify || { flush; apply; } ;;\n        status)\n          iptables -t nat -L \"$CHAIN\" -n -v --line-numbers\n          iptables -L \"$CHAIN\" -n -v --line-numbers\n          ;;\n        *) echo \"usage: ${0##*/} {apply|flush|verify|reconcile|status}\" >&2; exit 64 ;;\n      esac\n\n  - path: /usr/local/sbin/private-link-healthcheck\n    permissions: '0755'\n    content: |\n      #!/usr/bin/env bash\n      # Socket-activated health responder for the Azure Application Health extension.\n      #\n      # It answers two independent questions, because either failing alone produces a silently\n      # broken appliance that a liveness-only probe (Learn's tutorial probes port 22) reports as\n      # healthy:\n      #\n      #   1. Are the forwarding rules actually installed right now?\n      #   2. Is at least one configured target actually accepting TCP right now?\n      #\n      # Note that (2) is a locally originated connection, so it traverses OUTPUT and does not\n      # exercise the DNAT rules — which is exactly why (1) is checked separately rather than\n      # assumed. Together they cover the full path.\n      #\n      # No `set -e`: a probe that opens the socket and stalls must produce a response, not an\n      # unhandled exit.\n\n      MAP=/etc/private-link-forwarder/forward.map\n\n      # Drain the HTTP request. The content is irrelevant; the timeouts guard against a stalled\n      # or half-open probe holding the socket-activated instance open.\n      read -r -t 2 _ || true\n      while IFS= read -r -t 1 line; do\n        [ -z \"${line%$'\\r'}\" ] && break\n      done\n\n      state=\"Healthy\"\n\n      /usr/local/sbin/private-link-forwarder verify >/dev/null 2>&1 || state=\"Unhealthy\"\n\n      if [ \"$state\" = \"Healthy\" ]; then\n        reachable=0\n        while read -r listen host port _rest; do\n          case \"${listen:-}\" in ''|\\#*) continue ;; esac\n          [ -n \"${host:-}\" ] && [ -n \"${port:-}\" ] || continue\n          if timeout 3 bash -c \"exec 3<>/dev/tcp/${host}/${port}\" 2>/dev/null; then\n            reachable=1\n            break\n          fi\n        done < \"$MAP\"\n        [ \"$reachable\" -eq 1 ] || state=\"Unhealthy\"\n      fi\n\n      # Rich Health States contract: always answer 2xx and carry the verdict in the body. A\n      # non-2xx is interpreted as \"Unknown\", which loses the distinction between \"the app says\n      # it is unhealthy\" and \"the probe could not reach the app at all\".\n      body=\"{\\\"ApplicationHealthState\\\":\\\"${state}\\\"}\"\n      printf 'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: %d\\r\\nConnection: close\\r\\n\\r\\n%s' \\\n        \"${#body}\" \"$body\"\n\n  - path: /etc/systemd/system/private-link-forwarder.service\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Private Link forwarding appliance rules\n      Documentation=https://github.com/AzureGovGuy/arm-pls-appliance\n      Wants=network-online.target\n      After=network-online.target systemd-sysctl.service\n      [Service]\n      Type=oneshot\n      RemainAfterExit=yes\n      ExecStart=/usr/local/sbin/private-link-forwarder apply\n      ExecReload=/usr/local/sbin/private-link-forwarder apply\n      ExecStop=/usr/local/sbin/private-link-forwarder flush\n      [Install]\n      WantedBy=multi-user.target\n\n  - path: /etc/systemd/system/private-link-forwarder-reconcile.service\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Reconcile Private Link forwarding appliance rules\n      After=private-link-forwarder.service\n      [Service]\n      Type=oneshot\n      ExecStart=/usr/local/sbin/private-link-forwarder reconcile\n\n  - path: /etc/systemd/system/private-link-forwarder-reconcile.timer\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Periodic drift check for Private Link forwarding rules\n      [Timer]\n      OnBootSec=2min\n      OnUnitActiveSec=5min\n      AccuracySec=30s\n      [Install]\n      WantedBy=timers.target\n\n  - path: /etc/systemd/system/private-link-health.socket\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Private Link forwarding appliance health endpoint\n      [Socket]\n      # Loopback only. The Application Health extension runs on the instance and probes locally,\n      # so this endpoint never needs to be reachable from the VNet and never needs an NSG rule.\n      ListenStream=127.0.0.1:__HEALTH_PORT__\n      Accept=yes\n      [Install]\n      WantedBy=sockets.target\n\n  - path: /etc/systemd/system/private-link-health@.service\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Private Link forwarding appliance health responder\n      [Service]\n      Type=simple\n      ExecStart=/usr/local/sbin/private-link-healthcheck\n      StandardInput=socket\n      StandardOutput=socket\n      StandardError=journal\n      TimeoutStartSec=15s\n\nruncmd:\n  - [modprobe, nf_conntrack]\n  - [sysctl, --system]\n  - [systemctl, daemon-reload]\n  - [systemctl, enable, --now, private-link-forwarder.service]\n  - [systemctl, enable, --now, private-link-forwarder-reconcile.timer]\n  - [systemctl, enable, --now, private-link-health.socket]\n\nfinal_message: 'Private Link forwarding appliance ready after $UPTIME seconds.'\n",
+    "cloudInit": "[replace(replace(variables('cloudInitTemplate'), '__FORWARD_MAP__', variables('forwardMapLine')), '__HEALTH_PORT__', string(parameters('healthPort')))]"
   },
   "resources": [
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2023-11-01",
+      "name": "[variables('natGatewayIpName')]",
+      "condition": "[parameters('enableInternetEgress')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Regional"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "publicIPAddressVersion": "IPv4"
+      }
+    },
+    {
+      "type": "Microsoft.Network/natGateways",
+      "apiVersion": "2023-11-01",
+      "name": "[variables('natGatewayName')]",
+      "condition": "[parameters('enableInternetEgress')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('natGatewayIpName'))]"
+      ],
+      "properties": {
+        "idleTimeoutInMinutes": 10,
+        "publicIpAddresses": [
+          {
+            "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('natGatewayIpName'))]"
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-11-01",
+      "name": "[variables('nsgName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "securityRules": "[variables('securityRules')]"
+      }
+    },
     {
       "type": "Microsoft.Network/virtualNetworks",
       "apiVersion": "2023-11-01",
       "name": "[variables('vnetName')]",
       "location": "[parameters('location')]",
       "tags": "[parameters('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]",
+        "[resourceId('Microsoft.Network/natGateways', variables('natGatewayName'))]"
+      ],
       "properties": {
         "addressSpace": {
           "addressPrefixes": [
@@ -128,9 +318,13 @@
         },
         "subnets": [
           {
-            "name": "[variables('backendSubnetName')]",
+            "name": "[variables('forwarderSubnetName')]",
             "properties": {
-              "addressPrefix": "[parameters('natBackendSubnetPrefix')]"
+              "addressPrefix": "[parameters('forwarderSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+              },
+              "natGateway": "[if(parameters('enableInternetEgress'), createObject('id', resourceId('Microsoft.Network/natGateways', variables('natGatewayName'))), null())]"
             }
           },
           {
@@ -144,43 +338,6 @@
             "properties": {
               "addressPrefix": "[parameters('privateLinkServiceNatSubnetPrefix')]",
               "privateLinkServiceNetworkPolicies": "Disabled"
-            }
-          }
-        ]
-      }
-    },
-    {
-      "type": "Microsoft.Network/networkSecurityGroups",
-      "apiVersion": "2023-11-01",
-      "name": "[variables('nsgName')]",
-      "location": "[parameters('location')]",
-      "tags": "[parameters('tags')]",
-      "properties": {
-        "securityRules": [
-          {
-            "name": "Allow-PrivateLink-Service-Traffic",
-            "properties": {
-              "priority": 100,
-              "direction": "Inbound",
-              "access": "Allow",
-              "protocol": "Tcp",
-              "sourcePortRange": "*",
-              "destinationPortRange": "[string(parameters('targetPort'))]",
-              "sourceAddressPrefix": "[parameters('privateLinkServiceNatSubnetPrefix')]",
-              "destinationAddressPrefix": "*"
-            }
-          },
-          {
-            "name": "Allow-Load-Balancer-Probe",
-            "properties": {
-              "priority": 110,
-              "direction": "Inbound",
-              "access": "Allow",
-              "protocol": "Tcp",
-              "sourcePortRange": "*",
-              "destinationPortRange": "[string(parameters('targetPort'))]",
-              "sourceAddressPrefix": "AzureLoadBalancer",
-              "destinationAddressPrefix": "*"
             }
           }
         ]
@@ -254,100 +411,131 @@
       }
     },
     {
-      "type": "Microsoft.Network/networkInterfaces",
-      "apiVersion": "2023-11-01",
-      "name": "[variables('nicName')]",
+      "type": "Microsoft.Compute/virtualMachineScaleSets",
+      "apiVersion": "2024-07-01",
+      "name": "[variables('vmssName')]",
       "location": "[parameters('location')]",
       "tags": "[parameters('tags')]",
+      "zones": "[parameters('availabilityZones')]",
+      "sku": {
+        "name": "[parameters('vmSize')]",
+        "tier": "Standard",
+        "capacity": "[parameters('instanceCount')]"
+      },
       "dependsOn": [
         "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
-        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]",
-        "[resourceId('Microsoft.Network/loadBalancers', variables('lbName'))]"
+        "[resourceId('Microsoft.Network/loadBalancers', variables('lbName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
       ],
       "properties": {
-        "enableIPForwarding": true,
-        "networkSecurityGroup": {
-          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+        "orchestrationMode": "Flexible",
+        "platformFaultDomainCount": 1,
+        "singlePlacementGroup": false,
+        "automaticRepairsPolicy": {
+          "enabled": "[parameters('enableAutomaticRepairs')]",
+          "gracePeriod": "PT30M",
+          "repairAction": "Replace"
         },
-        "ipConfigurations": [
-          {
-            "name": "primary",
-            "properties": {
-              "privateIPAddress": "[parameters('forwardingVmPrivateIp')]",
-              "privateIPAllocationMethod": "Static",
-              "privateIPAddressVersion": "IPv4",
-              "subnet": {
-                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('backendSubnetName'))]"
-              },
-              "loadBalancerBackendAddressPools": [
-                {
-                  "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('lbName'), variables('lbBackendPoolName'))]"
-                }
-              ]
+        "virtualMachineProfile": {
+          "securityProfile": {
+            "securityType": "TrustedLaunch",
+            "uefiSettings": {
+              "secureBootEnabled": true,
+              "vTpmEnabled": true
             }
-          }
-        ]
-      }
-    },
-    {
-      "type": "Microsoft.Compute/virtualMachines",
-      "apiVersion": "2024-03-01",
-      "name": "[variables('vmName')]",
-      "location": "[parameters('location')]",
-      "tags": "[parameters('tags')]",
-      "dependsOn": [
-        "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
-      ],
-      "properties": {
-        "hardwareProfile": {
-          "vmSize": "[parameters('vmSize')]"
-        },
-        "osProfile": {
-          "computerName": "[variables('vmName')]",
-          "adminUsername": "[parameters('adminUsername')]",
-          "customData": "[base64(format(variables('cloudInitTemplate'), parameters('targetSQLServer'), parameters('targetPort')))]",
-          "linuxConfiguration": {
-            "disablePasswordAuthentication": true,
-            "ssh": {
-              "publicKeys": [
-                {
-                  "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
-                  "keyData": "[parameters('adminSshPublicKey')]"
-                }
-              ]
-            }
-          }
-        },
-        "storageProfile": {
-          "imageReference": {
-            "publisher": "Canonical",
-            "offer": "0001-com-ubuntu-server-jammy",
-            "sku": "22_04-lts-gen2",
-            "version": "latest"
           },
-          "osDisk": {
-            "createOption": "FromImage",
-            "caching": "ReadWrite",
-            "managedDisk": {
-              "storageAccountType": "Standard_LRS"
-            },
-            "diskSizeGB": 30,
-            "deleteOption": "Delete"
-          }
-        },
-        "networkProfile": {
-          "networkInterfaces": [
-            {
-              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]",
-              "properties": {
-                "deleteOption": "Delete"
+          "osProfile": {
+            "computerNamePrefix": "[variables('computerNamePrefix')]",
+            "adminUsername": "[parameters('adminUsername')]",
+            "customData": "[base64(variables('cloudInit'))]",
+            "linuxConfiguration": {
+              "disablePasswordAuthentication": true,
+              "provisionVMAgent": true,
+              "patchSettings": {
+                "patchMode": "[if(parameters('enableInternetEgress'), 'AutomaticByPlatform', 'ImageDefault')]",
+                "assessmentMode": "[if(parameters('enableInternetEgress'), 'AutomaticByPlatform', 'ImageDefault')]"
+              },
+              "ssh": {
+                "publicKeys": [
+                  {
+                    "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+                    "keyData": "[parameters('adminSshPublicKey')]"
+                  }
+                ]
               }
             }
-          ]
-        },
-        "diagnosticsProfile": {
-          "bootDiagnostics": {
-            "enabled": true
+          },
+          "storageProfile": {
+            "imageReference": "[parameters('imageReference')]",
+            "osDisk": {
+              "createOption": "FromImage",
+              "caching": "ReadOnly",
+              "managedDisk": {
+                "storageAccountType": "Premium_LRS"
+              },
+              "diskSizeGB": 30,
+              "deleteOption": "Delete"
+            }
+          },
+          "networkProfile": {
+            "networkApiVersion": "2020-11-01",
+            "networkInterfaceConfigurations": [
+              {
+                "name": "[variables('nicConfigName')]",
+                "properties": {
+                  "primary": true,
+                  "enableAcceleratedNetworking": "[parameters('enableAcceleratedNetworking')]",
+                  "enableIPForwarding": true,
+                  "deleteOption": "Delete",
+                  "networkSecurityGroup": {
+                    "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+                  },
+                  "ipConfigurations": [
+                    {
+                      "name": "primary",
+                      "properties": {
+                        "primary": true,
+                        "privateIPAddressVersion": "IPv4",
+                        "subnet": {
+                          "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('forwarderSubnetName'))]"
+                        },
+                        "loadBalancerBackendAddressPools": [
+                          {
+                            "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('lbName'), variables('lbBackendPoolName'))]"
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "extensionProfile": {
+            "extensions": [
+              {
+                "name": "HealthExtension",
+                "properties": {
+                  "publisher": "Microsoft.ManagedServices",
+                  "type": "ApplicationHealthLinux",
+                  "typeHandlerVersion": "2.0",
+                  "autoUpgradeMinorVersion": true,
+                  "settings": {
+                    "protocol": "http",
+                    "port": "[parameters('healthPort')]",
+                    "requestPath": "/healthz",
+                    "intervalInSeconds": 15,
+                    "numberOfProbes": 2,
+                    "gracePeriod": 600
+                  }
+                }
+              }
+            ]
+          },
+          "diagnosticsProfile": {
+            "bootDiagnostics": {
+              "enabled": true
+            }
           }
         }
       }
@@ -360,7 +548,7 @@
       "tags": "[parameters('tags')]",
       "dependsOn": [
         "[resourceId('Microsoft.Network/loadBalancers', variables('lbName'))]",
-        "[resourceId('Microsoft.Compute/virtualMachines', variables('vmName'))]"
+        "[resourceId('Microsoft.Compute/virtualMachineScaleSets', variables('vmssName'))]"
       ],
       "properties": {
         "loadBalancerFrontendIpConfigurations": [
@@ -413,13 +601,20 @@
       "type": "string",
       "value": "[parameters('loadBalancerPrivateIp')]"
     },
-    "forwardingVmName": {
+    "scaleSetName": {
       "type": "string",
-      "value": "[variables('vmName')]"
+      "value": "[variables('vmssName')]"
     },
-    "forwardingVmPrivateIp": {
+    "forwarderSubnetPrefix": {
       "type": "string",
-      "value": "[parameters('forwardingVmPrivateIp')]"
+      "value": "[parameters('forwarderSubnetPrefix')]",
+      "metadata": {
+        "description": "Allow-list this prefix on the target's firewall. Instances take dynamic addresses, so individual instance IPs are not stable."
+      }
+    },
+    "internetEgressEnabled": {
+      "type": "bool",
+      "value": "[parameters('enableInternetEgress')]"
     },
     "target": {
       "type": "string",
