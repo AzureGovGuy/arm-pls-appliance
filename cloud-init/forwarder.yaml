@@ -74,13 +74,21 @@ write_files:
       #!/usr/bin/env bash
       # Builds the DNAT/SNAT/forward rules for the Private Link forwarding appliance.
       #
-      # All rules live in dedicated PLS_FORWARDER chains rather than in the built-in chains.
-      # That makes `apply` a full rebuild that is idempotent and atomic enough to re-run at any
-      # time, and makes `flush` able to remove everything this appliance owns without disturbing
-      # rules added by any other agent on the host.
+      # Rules live in dedicated chains rather than in the built-in chains, so `apply` is a full
+      # rebuild that is idempotent and re-runnable at any time, and `flush` removes everything
+      # this appliance owns without disturbing rules added by any other agent on the host.
+      #
+      # There is one chain per hook, never one shared chain. netfilter validates a user chain
+      # against the intersection of the hooks that reach it, so a single nat chain jumped from
+      # both PREROUTING and POSTROUTING can hold neither DNAT (PREROUTING/OUTPUT only) nor
+      # MASQUERADE (POSTROUTING only) nor an -i match (no input interface at POSTROUTING). The
+      # append fails with "RULE_APPEND failed (Invalid argument)" and, under set -e, the whole
+      # apply aborts leaving the chains created but empty — forwarding silently dead.
       set -euo pipefail
 
-      CHAIN=PLS_FORWARDER
+      DNAT_CHAIN=PLS_PREROUTING
+      SNAT_CHAIN=PLS_POSTROUTING
+      FWD_CHAIN=PLS_FORWARD
       MAP=/etc/private-link-forwarder/forward.map
 
       # Derive the uplink instead of hardcoding eth0. Accelerated networking on D-series adds a
@@ -103,48 +111,48 @@ write_files:
       }
 
       ensure_chain() {
-        local table="$1" parent="$2"
-        iptables -t "$table" -N "$CHAIN" 2>/dev/null || iptables -t "$table" -F "$CHAIN"
-        iptables -t "$table" -C "$parent" -j "$CHAIN" 2>/dev/null \
-          || iptables -t "$table" -I "$parent" 1 -j "$CHAIN"
+        local table="$1" parent="$2" chain="$3"
+        iptables -t "$table" -N "$chain" 2>/dev/null || iptables -t "$table" -F "$chain"
+        iptables -t "$table" -C "$parent" -j "$chain" >/dev/null 2>&1 \
+          || iptables -t "$table" -I "$parent" 1 -j "$chain"
       }
 
       apply() {
         local dev
         dev="$(uplink)"
 
-        ensure_chain nat PREROUTING
-        ensure_chain nat POSTROUTING
-        ensure_chain filter FORWARD
+        ensure_chain nat PREROUTING "$DNAT_CHAIN"
+        ensure_chain nat POSTROUTING "$SNAT_CHAIN"
+        ensure_chain filter FORWARD "$FWD_CHAIN"
 
         while read -r listen host port; do
           # Inbound from the load balancer: rewrite the destination to the real target.
-          iptables -t nat -A "$CHAIN" -i "$dev" -p tcp --dport "$listen" \
+          iptables -t nat -A "$DNAT_CHAIN" -i "$dev" -p tcp --dport "$listen" \
             -j DNAT --to-destination "$host:$port"
           # Outbound to the target: rewrite the source to this instance, so the target needs a
           # return route only to this VNet rather than to the Fabric managed VNet.
-          iptables -t nat -A "$CHAIN" -p tcp -d "$host" --dport "$port" -j MASQUERADE
-          iptables -A "$CHAIN" -p tcp -d "$host" --dport "$port" -j ACCEPT
+          iptables -t nat -A "$SNAT_CHAIN" -p tcp -d "$host" --dport "$port" -j MASQUERADE
+          iptables -A "$FWD_CHAIN" -p tcp -d "$host" --dport "$port" -j ACCEPT
         done < <(mappings)
 
         # Return traffic for every mapping, in one rule rather than one per target.
-        iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -A "$FWD_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      }
+
+      flush_one() {
+        local table="$1" parent="$2" chain="$3"
+        # Loop: a repeated apply/upgrade could have left more than one jump in place.
+        while iptables -t "$table" -C "$parent" -j "$chain" >/dev/null 2>&1; do
+          iptables -t "$table" -D "$parent" -j "$chain"
+        done
+        iptables -t "$table" -F "$chain" 2>/dev/null || true
+        iptables -t "$table" -X "$chain" 2>/dev/null || true
       }
 
       flush() {
-        local pair table parent
-        for pair in nat:PREROUTING nat:POSTROUTING filter:FORWARD; do
-          table="${pair%%:*}"
-          parent="${pair##*:}"
-          # Loop: a repeated apply/upgrade could have left more than one jump in place.
-          while iptables -t "$table" -C "$parent" -j "$CHAIN" 2>/dev/null; do
-            iptables -t "$table" -D "$parent" -j "$CHAIN"
-          done
-        done
-        for table in nat filter; do
-          iptables -t "$table" -F "$CHAIN" 2>/dev/null || true
-          iptables -t "$table" -X "$CHAIN" 2>/dev/null || true
-        done
+        flush_one nat PREROUTING "$DNAT_CHAIN"
+        flush_one nat POSTROUTING "$SNAT_CHAIN"
+        flush_one filter FORWARD "$FWD_CHAIN"
       }
 
       # Exit 0 only when every rule this appliance owns is present. Used by the reconcile timer
@@ -153,15 +161,16 @@ write_files:
         local dev found=0
         dev="$(uplink)"
 
-        iptables -t nat -C PREROUTING -j "$CHAIN" 2>/dev/null || return 1
-        iptables -t nat -C POSTROUTING -j "$CHAIN" 2>/dev/null || return 1
-        iptables -C FORWARD -j "$CHAIN" 2>/dev/null || return 1
+        iptables -t nat -C PREROUTING -j "$DNAT_CHAIN" >/dev/null 2>&1 || return 1
+        iptables -t nat -C POSTROUTING -j "$SNAT_CHAIN" >/dev/null 2>&1 || return 1
+        iptables -C FORWARD -j "$FWD_CHAIN" >/dev/null 2>&1 || return 1
 
         while read -r listen host port; do
           found=1
-          iptables -t nat -C "$CHAIN" -i "$dev" -p tcp --dport "$listen" \
-            -j DNAT --to-destination "$host:$port" 2>/dev/null || return 1
-          iptables -t nat -C "$CHAIN" -p tcp -d "$host" --dport "$port" -j MASQUERADE 2>/dev/null || return 1
+          iptables -t nat -C "$DNAT_CHAIN" -i "$dev" -p tcp --dport "$listen" \
+            -j DNAT --to-destination "$host:$port" >/dev/null 2>&1 || return 1
+          iptables -t nat -C "$SNAT_CHAIN" -p tcp -d "$host" --dport "$port" \
+            -j MASQUERADE >/dev/null 2>&1 || return 1
         done < <(mappings)
 
         # An empty map means the appliance is unconfigured, which is a failure, not a pass.
@@ -178,8 +187,9 @@ write_files:
         # down live rules and no in-flight SYN can miss the DNAT during a rebuild window.
         reconcile) verify || { flush; apply; } ;;
         status)
-          iptables -t nat -L "$CHAIN" -n -v --line-numbers
-          iptables -L "$CHAIN" -n -v --line-numbers
+          iptables -t nat -L "$DNAT_CHAIN" -n -v --line-numbers
+          iptables -t nat -L "$SNAT_CHAIN" -n -v --line-numbers
+          iptables -L "$FWD_CHAIN" -n -v --line-numbers
           ;;
         *) echo "usage: ${0##*/} {apply|flush|verify|reconcile|status}" >&2; exit 64 ;;
       esac

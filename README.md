@@ -71,6 +71,14 @@ This template closes that gap structurally rather than by hand:
 | Single VM is a single point of failure | Instances are spread across availability zones |
 | B-series has no accelerated networking | D-series with accelerated networking enabled, which matters because this workload is packet-forwarding bound rather than CPU bound |
 
+### One chain per netfilter hook
+
+The rules live in three dedicated chains — `PLS_PREROUTING` for DNAT, `PLS_POSTROUTING` for MASQUERADE, and `PLS_FORWARD` for the filter rules — and never in one shared chain.
+
+This is not cosmetic. netfilter validates a rule against the intersection of the hooks that can reach its chain, and a user chain inherits the hooks of every built-in chain that jumps to it. A single `nat` chain entered from both `PREROUTING` and `POSTROUTING` can therefore hold neither `DNAT` (valid only at `PREROUTING`/`OUTPUT`), nor `MASQUERADE` (valid only at `POSTROUTING`), nor an `-i` match (there is no input interface at `POSTROUTING`). The append fails with `RULE_APPEND failed (Invalid argument)` and, under `set -e`, aborts the whole apply — leaving the chains created but empty and forwarding silently dead while the VM looks perfectly healthy.
+
+`tools/Test-Forwarder.sh` models this hook validation in its `iptables` stub and asserts the failure directly, so the mistake cannot reappear without the offline suite going red.
+
 ### Health checking is deliberately split in two
 
 The load balancer and the scale set answer different questions, and Flexible orchestration forces them apart.
@@ -114,13 +122,12 @@ Run the helper script with an existing SSH public key:
 ./deploy.ps1 `
   -ResourceGroupName rg-customer-pls-lab `
   -Location eastus2 `
-  -Target sqlprod01=10.40.1.4 `
-  -Target sqlprod02=10.40.1.5 `
+  -Target sqlprod01=10.40.1.4, sqlprod02=10.40.1.5 `
   -AdminSshPublicKey (Get-Content ~/.ssh/id_ed25519.pub -Raw) `
   -ConsumerSubscriptionIds <fabric-or-adf-subscription-id>
 ```
 
-Each `-Target` is `name=host` or `name=host:port`, and the port defaults to 1433. `name` must be unique because it names that target's frontend, probe, rule and Private Link Service. The script prints the alias for each target when the deployment completes.
+`-Target` takes a comma-separated list; each entry is `name=host` or `name=host:port`, and the port defaults to 1433. `name` must be unique because it names that target's frontend, probe, rule and Private Link Service. The script prints the alias for each target when the deployment completes.
 
 Add `-WhatIf` to preview the change set, `-InstanceCount` to size the fleet, and `-EnableInternetEgress` to add the NAT gateway. Add `-AutoApproveConsumers` only when private endpoint requests from every listed consumer subscription should be approved automatically. Otherwise, approve each connection on the deployed Private Link Services.
 

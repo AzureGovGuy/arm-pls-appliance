@@ -35,10 +35,43 @@ chain="$1"; shift || true
 if [ "$action" = "-I" ] && [[ "${1:-}" =~ ^[0-9]+$ ]]; then shift; fi
 rule="$*"
 key="$table|$chain|$rule"
+
+# netfilter validates a rule against the hooks that can reach its chain, and a user chain
+# inherits the hooks of every built-in chain that jumps to it. Reproducing that here is the
+# whole point of the stub: without it, an appliance that puts DNAT and MASQUERADE in one
+# shared chain passes every offline test and then fails to install a single rule on a real
+# kernel. Parents are known before rules are appended because the jump is created first.
+hook_violation() {
+  local parents p padded=" $rule "
+  parents="$(awk -F'|' -v t="$table" -v r="-j $chain" '$1 == t && $3 == r { print $2 }' "$STATE")"
+  [ -n "$parents" ] || return 1
+  for p in $parents; do
+    case "$rule" in
+      *"-j DNAT"*)
+        [ "$p" = PREROUTING ] || [ "$p" = OUTPUT ] || return 0 ;;
+    esac
+    case "$rule" in
+      *"-j MASQUERADE"*|*"-j SNAT"*)
+        [ "$p" = POSTROUTING ] || return 0 ;;
+    esac
+    if [[ "$padded" == *" -i "* ]] && { [ "$p" = POSTROUTING ] || [ "$p" = OUTPUT ]; }; then
+      return 0
+    fi
+    if [[ "$padded" == *" -o "* ]] && { [ "$p" = PREROUTING ] || [ "$p" = INPUT ]; }; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 case "$action" in
   -N) grep -qxF "$table|$chain|__EXISTS__" "$STATE" && exit 1
       echo "$table|$chain|__EXISTS__" >> "$STATE"; exit 0 ;;
   -A|-I) grep -qxF "$table|$chain|__EXISTS__" "$STATE" || exit 1
+         if hook_violation; then
+           echo "iptables v1.8.7 (nf_tables):  RULE_APPEND failed (Invalid argument): rule in chain $chain" >&2
+           exit 4
+         fi
          echo "$key" >> "$STATE"; exit 0 ;;
   -C) grep -qxF "$key" "$STATE" ;;
   -D) grep -qxF "$key" "$STATE" || exit 1
@@ -99,7 +132,19 @@ dnat=$(grep -c 'DNAT --to-destination 10.100.5.20:1433' "$STATE")
 masq=$(grep -c 'MASQUERADE' "$STATE")
 echo "  rules: dnat=$dnat masquerade=$masq"
 [ "$dnat" = 1 ] && check "exactly one DNAT rule" 0 0 || check "exactly one DNAT rule" 0 1
-grep -q 'nat|PLS_FORWARDER|-i eth0 -p tcp --dport 1433' "$STATE"; check "DNAT bound to derived uplink eth0" 0 $?
+grep -q 'nat|PLS_PREROUTING|-i eth0 -p tcp --dport 1433' "$STATE"; check "DNAT bound to derived uplink eth0" 0 $?
+grep -q 'nat|PLS_POSTROUTING|.*MASQUERADE' "$STATE"; check "MASQUERADE lives in a POSTROUTING-only chain" 0 $?
+
+# Regression guard for the fault that only a real kernel exposed: one shared nat chain reached
+# from both PREROUTING and POSTROUTING can hold neither DNAT nor MASQUERADE nor -i.
+iptables -t nat -N PLS_SHARED_PROBE 2>/dev/null
+iptables -t nat -I PREROUTING 1 -j PLS_SHARED_PROBE
+iptables -t nat -I POSTROUTING 1 -j PLS_SHARED_PROBE
+iptables -t nat -A PLS_SHARED_PROBE -i eth0 -p tcp --dport 1433 -j DNAT --to-destination 10.0.0.9:1433 2>/dev/null
+check "a chain on both nat hooks rejects DNAT" 4 $?
+iptables -t nat -D PREROUTING -j PLS_SHARED_PROBE
+iptables -t nat -D POSTROUTING -j PLS_SHARED_PROBE
+iptables -t nat -X PLS_SHARED_PROBE
 
 echo "== idempotency =="
 "$FWD" apply >/dev/null 2>&1
@@ -159,8 +204,8 @@ printf '# listenPort targetHost targetPort\n1433 10.100.5.20 1433\n' > "$WORK/fo
 echo "== flush =="
 "$FWD" flush; check "flush succeeds" 0 $?
 "$FWD" verify; check "verify fails after flush" 1 $?
-left=$(grep -c 'PLS_FORWARDER' "$STATE" || true)
-echo "  residual PLS_FORWARDER entries: $left"
+left=$(grep -c 'PLS_PREROUTING\|PLS_POSTROUTING\|PLS_FORWARD' "$STATE" || true)
+echo "  residual appliance entries: $left"
 [ "$left" = 0 ] && check "flush removes every owned rule" 0 0 || check "flush removes every owned rule" 0 1
 
 echo "== health responder =="

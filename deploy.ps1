@@ -12,6 +12,7 @@ param(
 
     [string] $Location = "eastus2",
     [string] $Prefix = "customer-pls-lab",
+    [string] $DeploymentName = "pls-appliance",
     [int] $BackendPortBase = 11433,
     [int] $InstanceCount = 2,
     [string] $VmSize = "Standard_D2s_v5",
@@ -48,19 +49,20 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $autoApprovalSubscriptionIds = if ($AutoApproveConsumers) { $ConsumerSubscriptionIds } else { @() }
-$consumerSubscriptionIdsJson = ConvertTo-Json -Compress -InputObject @($ConsumerSubscriptionIds)
-$autoApprovalSubscriptionIdsJson = ConvertTo-Json -Compress -InputObject @($autoApprovalSubscriptionIds)
-$availabilityZonesJson = ConvertTo-Json -Compress -InputObject @($AvailabilityZones)
+
+# Get-Content -Raw keeps the trailing newline, which Azure rejects as a malformed key. This must
+# happen before the parameter document is built, not after.
+$AdminSshPublicKey = $AdminSshPublicKey.Trim()
 
 # Each -Target becomes its own load balancer frontend and its own Private Link Service, so the
 # consumer connects to the server's real hostname on its real port. Accepts "name=host" or
 # "name=host:port"; the port defaults to 1433.
 $targets = @($Target | ForEach-Object {
         $label, $endpoint = $_.Split('=', 2)
-        $host_, $port = $endpoint.Split(':', 2)
+        $address, $port = $endpoint.Split(':', 2)
         [ordered]@{
             name = $label
-            host = $host_
+            host = $address
             port = if ($port) { [int] $port } else { 1433 }
         }
     })
@@ -70,10 +72,36 @@ if ($duplicateNames) {
     throw "Duplicate target names: $($duplicateNames.Name -join ', '). Each target name must be unique; it is used in resource names."
 }
 
-$targetsJson = ConvertTo-Json -Compress -Depth 5 -InputObject $targets
+# Parameters go in a file rather than on the command line. `--parameters key=value` requires the
+# value to survive PowerShell's argument handling, which strips the inner double quotes from a
+# JSON literal: an array arrives as [{name:sqlu1}] and az rejects it. A parameters file has no
+# quoting to lose.
+$parameterValues = [ordered]@{
+    prefix                      = $Prefix
+    targets                     = $targets
+    backendPortBase             = $BackendPortBase
+    adminSshPublicKey           = $AdminSshPublicKey
+    instanceCount               = $InstanceCount
+    vmSize                      = $VmSize
+    enableInternetEgress        = $EnableInternetEgress.IsPresent
+    enableAutomaticRepairs      = $EnableAutomaticRepairs
+    adminSourceAddressPrefix    = $AdminSourceAddressPrefix
+    availabilityZones           = @($AvailabilityZones)
+    consumerSubscriptionIds     = @($ConsumerSubscriptionIds)
+    autoApprovalSubscriptionIds = @($autoApprovalSubscriptionIds)
+}
 
-# Get-Content -Raw keeps the trailing newline, which Azure rejects as a malformed key.
-$AdminSshPublicKey = $AdminSshPublicKey.Trim()
+$parameterDocument = [ordered]@{
+    '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
+    contentVersion = '1.0.0.0'
+    parameters     = [ordered]@{}
+}
+foreach ($name in $parameterValues.Keys) {
+    $parameterDocument.parameters[$name] = @{ value = $parameterValues[$name] }
+}
+
+$parameterPath = Join-Path ([System.IO.Path]::GetTempPath()) ("pls-appliance-{0}.parameters.json" -f [guid]::NewGuid().ToString('N'))
+[System.IO.File]::WriteAllText($parameterPath, (ConvertTo-Json -InputObject $parameterDocument -Depth 10))
 
 # Only create the resource group when it is absent. Re-issuing the create against an existing
 # group with a different -Location fails rather than silently doing nothing, and resources follow
@@ -88,28 +116,21 @@ if ($rgExists -ne "true") {
 
 $deploymentArgs = @(
     "--resource-group", $ResourceGroupName,
+    "--name", $DeploymentName,
     "--template-file", $templateFile,
-    "--parameters",
-    "prefix=$Prefix",
-    "targets=$targetsJson",
-    "backendPortBase=$BackendPortBase",
-    "adminSshPublicKey=$AdminSshPublicKey",
-    "instanceCount=$InstanceCount",
-    "vmSize=$VmSize",
-    "enableInternetEgress=$($EnableInternetEgress.IsPresent.ToString().ToLower())",
-    "enableAutomaticRepairs=$($EnableAutomaticRepairs.ToString().ToLower())",
-    "adminSourceAddressPrefix=$AdminSourceAddressPrefix",
-    "availabilityZones=$availabilityZonesJson",
-    "consumerSubscriptionIds=$consumerSubscriptionIdsJson",
-    "autoApprovalSubscriptionIds=$autoApprovalSubscriptionIdsJson"
+    "--parameters", "@$parameterPath"
 )
 
-if ($WhatIf) {
-    az deployment group what-if @deploymentArgs
-}
-else {
+try {
+    if ($WhatIf) {
+        az deployment group what-if @deploymentArgs
+        return
+    }
+
     $result = az deployment group create @deploymentArgs --output json | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0) { throw "Deployment failed." }
+    if ($LASTEXITCODE -ne 0 -or -not $result) {
+        throw "Deployment '$DeploymentName' failed. For the failing resource and message, run: az deployment operation group list -g $ResourceGroupName -n $DeploymentName --query ""[?properties.provisioningState=='Failed'].properties.statusMessage"""
+    }
 
     # The aliases are the only outputs a consumer needs. Print them rather than making the
     # operator dig them back out of the deployment.
@@ -126,4 +147,7 @@ else {
         Format-Table -AutoSize
 
     Write-Host "Allow-list $($result.properties.outputs.forwarderSubnetPrefix.value) on each target's firewall."
+}
+finally {
+    Remove-Item -LiteralPath $parameterPath -Force -ErrorAction SilentlyContinue
 }
