@@ -5,9 +5,9 @@
 This resource-group-scoped ARM template deploys the provider side of a Private Link connection:
 
 - One virtual network with three dedicated subnets
-- One Standard internal load balancer
+- One Standard internal load balancer, with a dedicated frontend per target
 - One Flexible-orchestration virtual machine scale set of Ubuntu forwarding instances with IP forwarding enabled
-- One Private Link Service attached to the load balancer frontend
+- One Private Link Service per target, so every destination keeps its own hostname and its own port on the consumer side
 - NSG rules for Private Link Service traffic and load-balancer health probes, with an explicit inbound deny floor
 - Reboot-persistent DNAT, SNAT and forwarding rules managed by systemd and declared in `cloud-init/forwarder.yaml`
 - Application Health monitoring plus automatic instance repair
@@ -22,15 +22,35 @@ The template does not create Fabric, Azure Data Factory, a managed private endpo
 ## Traffic path
 
 ```text
-Fabric or ADF managed private endpoint
-  -> Private Link Service
-  -> Standard internal load balancer
-  -> forwarding instance (scale set)
+Fabric or ADF managed private endpoint   (one per target, named for the target's own FQDN)
+  -> Private Link Service                (one per target)
+  -> load balancer frontend              (one per target; frontend port is the target's real port)
+  -> forwarding instance (scale set)     (arrives on that target's private backend port)
   -> peered hub/spoke network
-  -> targetSQLServer:targetPort
+  -> target host:port
 ```
 
-`targetSQLServer` is the private IPv4 address of the destination SQL Server, including an on-premises server reached through ExpressRoute or a site-to-site VPN. The forwarding instances apply both DNAT and MASQUERADE. SQL Server sees the source as a forwarding instance private IP. The server must be reachable from the appliance VNet after the customer creates peering and any required hub routes or firewall rules.
+Each target's `host` is the private IPv4 address of the destination SQL Server, including an on-premises server reached through ExpressRoute or a site-to-site VPN. The forwarding instances apply both DNAT and MASQUERADE. SQL Server sees the source as a forwarding instance private IP. The server must be reachable from the appliance VNet after the customer creates peering and any required hub routes or firewall rules.
+
+## One Private Link Service per target
+
+A notebook author should write the server name they already know:
+
+```python
+spark.read.jdbc("jdbc:sqlserver://sqlprod01.corp.contoso.com:1433;databaseName=Sales", ...)
+```
+
+That is only possible if each destination gets its own Private Link Service. A Private Link Service has **no port configuration at all** — it binds to a load balancer frontend and carries every rule on it — so a single shared PLS would force a synthetic port per destination and hand every notebook author a port mapping matrix to memorise. This template does not do that.
+
+Instead each target gets its own frontend, its own PLS, and a load-balancing rule whose **frontend port is the target's real port**. The consumer side is therefore identical to a direct connection.
+
+The one thing that cannot be shared is the discriminator on the backend. A load balancer backend cannot see which frontend a packet arrived on:
+
+> Without Floating IP, the load balancer translates the destination address to the backend VM's private IP. The VM has no way to distinguish between the two flows.
+
+So the template assigns each target a distinct **backend** port from a private block starting at `backendPortBase` (default `11433`). That port exists only between the load balancer and the forwarding instance. It never appears in a connection string, a managed private endpoint, or any user-facing configuration.
+
+Limits worth knowing before sizing: a Standard load balancer supports **8 Private Link Services**, which is why `targets` is capped at 8. A single Fabric managed private endpoint carries up to 20 target FQDNs.
 
 ## Why a scale set rather than a single VM
 
@@ -55,9 +75,11 @@ This template closes that gap structurally rather than by hand:
 
 The load balancer and the scale set answer different questions, and Flexible orchestration forces them apart.
 
-The **load-balancer probe** targets `targetPort`. Because the DNAT rule matches probe traffic like any other, that probe traverses the full path to the real SQL Server. It decides whether an instance receives traffic.
+The **load-balancer probe** targets each rule's backend port. Because the DNAT rule matches probe traffic like any other, that probe traverses the full path to that target's real SQL Server. It decides, per target, whether an instance receives traffic — so one unreachable server takes only its own frontend out of rotation and leaves the others serving.
 
-The **Application Health extension** probes a loopback-only endpoint on `healthPort` that answers two independent questions: are the forwarding rules actually installed right now, and is the target actually accepting TCP right now. It decides whether an instance is replaced. Both must be checked, because the target reachability test is locally originated and therefore traverses `OUTPUT` rather than the DNAT rules in `PREROUTING`.
+The **Application Health extension** probes a loopback-only endpoint on `healthPort` that answers two independent questions: are the forwarding rules actually installed right now, and is **at least one** configured target accepting TCP right now. It decides whether an instance is replaced. Both must be checked, because the target reachability test is locally originated and therefore traverses `OUTPUT` rather than the DNAT rules in `PREROUTING`.
+
+"At least one" is deliberate with multiple targets. A single unreachable SQL Server is a problem with that server, not with the forwarding instance, and replacing healthy instances would not fix it — the per-target load-balancer probe already withdraws that one frontend. The extension reports Unhealthy only when the instance can reach nothing at all, which is the case a replacement can actually repair.
 
 Using the extension is not a preference. Load-balancer health probes cannot drive instance repair in Flexible orchestration; [the documented unsupported parameter list](https://learn.microsoft.com/en-us/azure/virtual-machine-scale-sets/virtual-machine-scale-sets-orchestration-modes) is explicit:
 
@@ -92,13 +114,15 @@ Run the helper script with an existing SSH public key:
 ./deploy.ps1 `
   -ResourceGroupName rg-customer-pls-lab `
   -Location eastus2 `
-  -TargetSQLServer 10.40.1.4 `
-  -TargetPort 1433 `
+  -Target sqlprod01=10.40.1.4 `
+  -Target sqlprod02=10.40.1.5 `
   -AdminSshPublicKey (Get-Content ~/.ssh/id_ed25519.pub -Raw) `
   -ConsumerSubscriptionIds <fabric-or-adf-subscription-id>
 ```
 
-Add `-WhatIf` to preview the change set, `-InstanceCount` to size the fleet, and `-EnableInternetEgress` to add the NAT gateway. Add `-AutoApproveConsumers` only when private endpoint requests from every listed consumer subscription should be approved automatically. Otherwise, approve each connection on the deployed Private Link Service.
+Each `-Target` is `name=host` or `name=host:port`, and the port defaults to 1433. `name` must be unique because it names that target's frontend, probe, rule and Private Link Service. The script prints the alias for each target when the deployment completes.
+
+Add `-WhatIf` to preview the change set, `-InstanceCount` to size the fleet, and `-EnableInternetEgress` to add the NAT gateway. Add `-AutoApproveConsumers` only when private endpoint requests from every listed consumer subscription should be approved automatically. Otherwise, approve each connection on the deployed Private Link Services.
 
 Alternatively, replace placeholders in `azuredeploy.parameters.json` and run:
 
@@ -137,12 +161,30 @@ curl -s http://127.0.0.1:8080/healthz
 
 ## Connect Fabric or ADF
 
-1. Copy the `privateLinkServiceAlias` deployment output.
-2. In Fabric or ADF, create a managed private endpoint targeting that alias or the `privateLinkServiceId`, depending on the product workflow.
-3. Approve the pending private endpoint connection on the Private Link Service unless auto-approval was enabled.
-4. Test the configured TCP port from the managed environment.
+The deployment emits a `privateLinkServices` array with one record per target, each carrying the target's `alias`, `consumerPort` and resolved endpoint.
 
-This template exposes one TCP port. The instance-side forwarding table at `/etc/private-link-forwarder/forward.map` accepts additional `listenPort targetHost targetPort` records, but each extra port also needs a matching load-balancing rule, probe and NSG rule in the template.
+1. For each record, create a managed private endpoint against its `alias`.
+2. Name the endpoint after the **target server's own FQDN**. Fabric resolves that name to the endpoint, which is what lets a notebook use the real server name.
+3. Approve each pending connection on the corresponding Private Link Service unless auto-approval was enabled.
+4. From the managed environment, connect to `<target-fqdn>:<consumerPort>`.
+
+Ignore `backendPort`. It is internal plumbing between the load balancer and the forwarding instances, and using it in a connection string will not work.
+
+A single Fabric managed private endpoint accepts up to 20 target FQDNs, so a handful of servers usually needs no additional endpoints beyond one per alias.
+
+### If you do not need a forwarding appliance at all
+
+[Private Link Service Direct Connect](https://learn.microsoft.com/azure/private-link/configure-private-link-service-direct-connect) points a Private Link Service straight at a routable destination IP, with no load balancer and no forwarding instances. Where it fits, it is simpler than this appliance. It is currently in **public preview**, and three limits decide whether it applies:
+
+- The Private Link Service and the ExpressRoute gateway **must be in the same virtual network**. Reaching on-premises through a peered hub's gateway is not supported, which rules out most hub-and-spoke landing zones.
+- A hardware limit of **10 Private Link Services per region per subscription**, against 800 for a regular Private Link Service.
+- Network security groups on the consumer private endpoints are **not supported** during the preview, and the preview regions are commercial only — it is not available in Azure Government.
+
+This appliance stays the generally available path, works from a spoke, and is supported in sovereign clouds.
+
+## Adding or removing targets
+
+Re-run the deployment with the new `-Target` set. Targets are positional: the frontend IP, PLS NAT IP and backend port are all derived from a target's index, so **removing a target from the middle of the list renumbers every target after it** and rebuilds their Private Link Services with new aliases. Append new targets to the end, and when retiring one, prefer leaving its slot in place until the consumer endpoints have been migrated.
 
 ## Peer to a hub
 

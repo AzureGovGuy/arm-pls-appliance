@@ -174,6 +174,7 @@ Other preview constraints worth pricing in:
 | Min 2 IP configs (multiples of 2, max 8) | Fine |
 | **Static destination IP only** | No AG listener failover to a second IP; see §5 |
 | Max **10 PLS per region per subscription** | Caps the "one PLS per SQL server" scaling pattern |
+| **Commercial regions only** | Not available in Azure Government. For a gov-targeted deliverable this alone is disqualifying |
 | 10 Gbps per Direct Connect | Well above ER capacity in most cases |
 | Same region for PE, PLS and client | ✅ MPE already lands `westus3` (proven at P3) |
 | PE `NetworkSecurityGroupEnabled` unsupported in preview | **Unverifiable for us** — the PE is in Microsoft's managed VNet; we cannot inspect its network policies |
@@ -414,6 +415,18 @@ These collapse into a single decision:
 ---
 
 ## 5. Recommendation
+
+### Resolved: many on-premises SQL Servers, without a port matrix
+
+The multi-target question is settled, and the answer changes nothing structural. **One Private Link Service per target**, each on its own load balancer frontend, with the frontend port set to the target's *real* port.
+
+The temptation is to share a single PLS across servers and separate them by port. That fails the only test that matters — a Spark notebook author would need a lookup table to write a connection string, and Learn's own Fabric sample sets `dbPort = 1433` against the server's own name. A PLS has no port configuration; it binds a frontend and carries every rule on it, so port-splitting is the *only* way to multiplex one PLS, and it is unacceptable.
+
+One thing genuinely cannot be shared: the load balancer backend cannot see which frontend a packet arrived on (*"The VM has no way to distinguish between the two flows"*), so the **backend** port must be unique per target. That port is invisible to consumers — it exists only between the load balancer and the forwarder.
+
+Ceiling: **8 PLS per Standard load balancer**, which is why `targets` is capped at 8. Note this is where Option C is *worse*, not better — Direct Connect's hardware cap is 10 per region per subscription across all uses.
+
+**`azuredeploy.json` implements this**: `targets` is an array, and frontends, probes, rules, NAT IPs, PLS resources and the instance forward map are all generated per target.
 
 **Primary: Option B + Option F — HAProxy TCP proxy on a VMSS.** Same topology as the documented pattern, so it inherits Learn's credibility, while fixing both of Option A's production defects — reboot persistence and the blind port-22 probe — and it is the only option that keeps TCP Proxy v2 on the table. Critically, it is also the **only family that is spoke-local**: it needs nothing from the hub except normal gateway transit, so it survives every governance answer the customer might give. The cost over Option A is a config file and a VMSS model.
 
