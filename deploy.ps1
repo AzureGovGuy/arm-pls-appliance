@@ -4,14 +4,15 @@ param(
     [string] $ResourceGroupName,
 
     [Parameter(Mandatory)]
-    [string] $TargetSQLServer,
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9-]{0,23}=[^:]+(:\d+)?$')]
+    [string[]] $Target,
 
     [Parameter(Mandatory)]
     [string] $AdminSshPublicKey,
 
     [string] $Location = "eastus2",
     [string] $Prefix = "customer-pls-lab",
-    [int] $TargetPort = 1433,
+    [int] $BackendPortBase = 11433,
     [int] $InstanceCount = 2,
     [string] $VmSize = "Standard_D2s_v5",
     [string[]] $AvailabilityZones = @("1", "2", "3"),
@@ -51,6 +52,26 @@ $consumerSubscriptionIdsJson = ConvertTo-Json -Compress -InputObject @($Consumer
 $autoApprovalSubscriptionIdsJson = ConvertTo-Json -Compress -InputObject @($autoApprovalSubscriptionIds)
 $availabilityZonesJson = ConvertTo-Json -Compress -InputObject @($AvailabilityZones)
 
+# Each -Target becomes its own load balancer frontend and its own Private Link Service, so the
+# consumer connects to the server's real hostname on its real port. Accepts "name=host" or
+# "name=host:port"; the port defaults to 1433.
+$targets = @($Target | ForEach-Object {
+        $label, $endpoint = $_.Split('=', 2)
+        $host_, $port = $endpoint.Split(':', 2)
+        [ordered]@{
+            name = $label
+            host = $host_
+            port = if ($port) { [int] $port } else { 1433 }
+        }
+    })
+
+$duplicateNames = @($targets.name | Group-Object | Where-Object Count -gt 1)
+if ($duplicateNames) {
+    throw "Duplicate target names: $($duplicateNames.Name -join ', '). Each target name must be unique; it is used in resource names."
+}
+
+$targetsJson = ConvertTo-Json -Compress -Depth 5 -InputObject $targets
+
 # Get-Content -Raw keeps the trailing newline, which Azure rejects as a malformed key.
 $AdminSshPublicKey = $AdminSshPublicKey.Trim()
 
@@ -70,8 +91,8 @@ $deploymentArgs = @(
     "--template-file", $templateFile,
     "--parameters",
     "prefix=$Prefix",
-    "targetSQLServer=$TargetSQLServer",
-    "targetPort=$TargetPort",
+    "targets=$targetsJson",
+    "backendPortBase=$BackendPortBase",
     "adminSshPublicKey=$AdminSshPublicKey",
     "instanceCount=$InstanceCount",
     "vmSize=$VmSize",
@@ -87,5 +108,22 @@ if ($WhatIf) {
     az deployment group what-if @deploymentArgs
 }
 else {
-    az deployment group create @deploymentArgs --output json
+    $result = az deployment group create @deploymentArgs --output json | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw "Deployment failed." }
+
+    # The aliases are the only outputs a consumer needs. Print them rather than making the
+    # operator dig them back out of the deployment.
+    Write-Host ""
+    Write-Host "Create one managed private endpoint per row, using the target's own FQDN as the"
+    Write-Host "endpoint resource name, then connect on Port. BackendPort is internal plumbing."
+    Write-Host ""
+    $result.properties.outputs.privateLinkServices.value |
+        Select-Object @{ n = 'Target'; e = { $_.name } },
+                      @{ n = 'Endpoint'; e = { $_.target } },
+                      @{ n = 'Port'; e = { $_.consumerPort } },
+                      @{ n = 'BackendPort'; e = { $_.backendPort } },
+                      @{ n = 'Alias'; e = { $_.alias } } |
+        Format-Table -AutoSize
+
+    Write-Host "Allow-list $($result.properties.outputs.forwarderSubnetPrefix.value) on each target's firewall."
 }

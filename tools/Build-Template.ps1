@@ -45,8 +45,15 @@ foreach ($path in @($templatePath, $cloudInitPath)) {
 $cloudInit = (Get-Content -LiteralPath $cloudInitPath -Raw) -replace "`r`n", "`n"
 
 foreach ($token in @('__FORWARD_MAP__', '__HEALTH_PORT__')) {
-    if ($cloudInit -notmatch [regex]::Escape($token)) {
+    $occurrences = [regex]::Matches($cloudInit, [regex]::Escape($token)).Count
+    if ($occurrences -eq 0) {
         throw "$cloudInitPath is missing the $token placeholder that azuredeploy.json substitutes at deployment time."
+    }
+    # ARM substitutes with a plain replace() and the forward map is multi-line, so a second
+    # occurrence — even inside a comment — injects unindented lines at that point and produces a
+    # cloud-init file that fails to parse on every boot.
+    if ($occurrences -gt 1) {
+        throw "$cloudInitPath contains $token $occurrences times. Each placeholder must appear exactly once, at its point of use."
     }
 }
 

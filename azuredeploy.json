@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "2.0.0.0",
+  "contentVersion": "3.0.0.0",
   "metadata": {
-    "description": "Deploys a standalone VNet with a Private Link Service, Standard internal load balancer, and a Flexible-orchestration virtual machine scale set of Linux forwarding appliances for Fabric or Azure Data Factory managed private endpoint connectivity.",
+    "description": "Deploys a standalone VNet with one Private Link Service per on-premises target, a Standard internal load balancer, and a Flexible-orchestration virtual machine scale set of Linux forwarding appliances for Fabric or Azure Data Factory managed private endpoint connectivity. Each target keeps its real hostname and its real port on the consumer side.",
     "cloudInitSource": "cloud-init/forwarder.yaml is the source of truth for the cloudInitTemplate variable. Run tools/Build-Template.ps1 after editing it, and tools/Build-Template.ps1 -Verify to confirm this file is in sync."
   },
   "parameters": {
@@ -41,25 +41,22 @@
       "type": "string",
       "defaultValue": "10.20.3.0/24"
     },
-    "loadBalancerPrivateIp": {
-      "type": "string",
-      "defaultValue": "10.20.2.4"
-    },
-    "privateLinkServiceNatIp": {
-      "type": "string",
-      "defaultValue": "10.20.3.4"
-    },
-    "targetSQLServer": {
-      "type": "string",
+    "targets": {
+      "type": "array",
+      "minLength": 1,
+      "maxLength": 8,
       "metadata": {
-        "description": "Private IPv4 address of the target SQL Server reached through hub/spoke or hybrid connectivity."
+        "description": "One entry per on-premises target, as { name, host, port }. Each target gets its own load balancer frontend and its own Private Link Service, so a consumer reaches it on the server's real hostname and real port with no port mapping to memorise. name is a short DNS-safe label used in resource names, host is the private IPv4 address of the server, port is the port it listens on. Limited to 8 because a Standard load balancer supports at most 8 Private Link Services."
       }
     },
-    "targetPort": {
+    "backendPortBase": {
       "type": "int",
-      "defaultValue": 1433,
-      "minValue": 1,
-      "maxValue": 65535
+      "defaultValue": 11433,
+      "minValue": 1024,
+      "maxValue": 65000,
+      "metadata": {
+        "description": "First port in the private block the forwarders listen on. A load balancer backend cannot tell which frontend a packet arrived on, so each target is given a distinct backend port to act as the discriminator. This is internal plumbing: consumers never see these ports."
+      }
     },
     "adminUsername": {
       "type": "string",
@@ -175,17 +172,33 @@
     "vmssName": "[format('{0}-forwarder-vmss', parameters('prefix'))]",
     "nicConfigName": "[format('{0}-forwarder-nic', parameters('prefix'))]",
     "lbName": "[format('{0}-internal-lb', parameters('prefix'))]",
-    "plsName": "[format('{0}-pls', parameters('prefix'))]",
     "natGatewayName": "[format('{0}-forwarder-natgw', parameters('prefix'))]",
     "natGatewayIpName": "[format('{0}-forwarder-natgw-pip', parameters('prefix'))]",
     "forwarderSubnetName": "forwarder-subnet",
     "lbSubnetName": "load-balancer-subnet",
     "plsNatSubnetName": "private-link-service-nat-subnet",
-    "lbFrontendName": "PrivateLinkFrontEnd",
     "lbBackendPoolName": "forwarderBackendPool",
-    "lbProbeName": "target-port-health",
-    "lbRuleName": "[format('forward-{0}', parameters('targetPort'))]",
     "computerNamePrefix": "[take(replace(parameters('prefix'), '-', ''), 9)]",
+    "lastBackendPort": "[add(parameters('backendPortBase'), sub(length(parameters('targets')), 1))]",
+    "backendPortRange": "[if(equals(length(parameters('targets')), 1), string(parameters('backendPortBase')), format('{0}-{1}', string(parameters('backendPortBase')), string(variables('lastBackendPort'))))]",
+    "mapDelimiter": "[json('\"\\n      \"')]",
+    "copy": [
+      {
+        "name": "frontendIps",
+        "count": "[length(parameters('targets'))]",
+        "input": "[cidrHost(parameters('loadBalancerSubnetPrefix'), add(3, copyIndex('frontendIps')))]"
+      },
+      {
+        "name": "natIps",
+        "count": "[length(parameters('targets'))]",
+        "input": "[cidrHost(parameters('privateLinkServiceNatSubnetPrefix'), add(3, copyIndex('natIps')))]"
+      },
+      {
+        "name": "forwardMapLines",
+        "count": "[length(parameters('targets'))]",
+        "input": "[format('{0} {1} {2}', string(add(parameters('backendPortBase'), copyIndex('forwardMapLines'))), parameters('targets')[copyIndex('forwardMapLines')].host, string(parameters('targets')[copyIndex('forwardMapLines')].port))]"
+      }
+    ],
     "baseSecurityRules": [
       {
         "name": "Allow-PrivateLink-Service-Traffic",
@@ -195,10 +208,10 @@
           "access": "Allow",
           "protocol": "Tcp",
           "sourcePortRange": "*",
-          "destinationPortRange": "[string(parameters('targetPort'))]",
+          "destinationPortRange": "[variables('backendPortRange')]",
           "sourceAddressPrefix": "[parameters('privateLinkServiceNatSubnetPrefix')]",
           "destinationAddressPrefix": "*",
-          "description": "Traffic arriving from the Private Link Service NAT subnet."
+          "description": "Traffic arriving from the Private Link Service NAT subnet, on the private backend port block."
         }
       },
       {
@@ -209,7 +222,7 @@
           "access": "Allow",
           "protocol": "Tcp",
           "sourcePortRange": "*",
-          "destinationPortRange": "[string(parameters('targetPort'))]",
+          "destinationPortRange": "[variables('backendPortRange')]",
           "sourceAddressPrefix": "AzureLoadBalancer",
           "destinationAddressPrefix": "*",
           "description": "Health probes from 168.63.129.16. DNAT'd to the target like real traffic, so this tests the whole path, not liveness."
@@ -247,9 +260,9 @@
       }
     ],
     "securityRules": "[concat(variables('baseSecurityRules'), if(empty(parameters('adminSourceAddressPrefix')), createArray(), variables('sshSecurityRule')))]",
-    "forwardMapLine": "[format('{0} {1} {2}', string(parameters('targetPort')), parameters('targetSQLServer'), string(parameters('targetPort')))]",
-    "cloudInitTemplate": "#cloud-config\n# Private Link forwarding appliance — VMSS instance bootstrap.\n#\n# This file is the single source of truth for instance configuration. `tools/Build-Template.ps1`\n# embeds it into the `cloudInitTemplate` variable in azuredeploy.json and ARM substitutes the two\n# placeholders below at deploy time, so the template stays self-contained and portal-deployable\n# while this file remains reviewable as real YAML. Run the build script after editing; deploy.ps1\n# refuses to deploy a template whose embedded copy has drifted from this file.\n#\n#   __FORWARD_MAP__   newline-separated \"listenPort targetHost targetPort\" records\n#   __HEALTH_PORT__   loopback TCP port serving the health endpoint for the Application Health extension\n#\n# Two constraints shape everything here:\n#\n#   1. No package installation. iptables, systemd and bash all ship in the Azure Ubuntu\n#      marketplace image. VMSS instances in Flexible orchestration have no default outbound\n#      internet access, and platform default outbound access retired in September 2025, so a\n#      cloud-init that runs `apt install` hangs for the whole boot in a locked-down subnet.\n#      Everything below works with zero egress.\n#\n#   2. Convergence, not first-boot setup. iptables rules live in the kernel and are lost on\n#      every reboot. Nothing here writes rules once; a systemd unit rebuilds them at boot and a\n#      timer reconciles drift, so reboot, platform patching, reimage and scale-out all land on\n#      identical state.\n\npackage_update: false\npackage_upgrade: false\n\nwrite_files:\n  # nf_conntrack must be resident before systemd-sysctl applies the tunables below, otherwise\n  # net.netfilter.* keys do not exist yet and are silently skipped at early boot.\n  - path: /etc/modules-load.d/private-link-forwarder.conf\n    permissions: '0644'\n    content: |\n      nf_conntrack\n\n  - path: /etc/sysctl.d/99-private-link-forwarder.conf\n    permissions: '0644'\n    content: |\n      # The Azure NIC has enableIPForwarding=true; this is the matching guest-side half.\n      # Both are required — either one alone silently blackholes forwarded traffic.\n      net.ipv4.ip_forward = 1\n\n      # Loose reverse-path filtering. Return traffic from on-premises can arrive on a path the\n      # strict check does not consider symmetric once a hub firewall or UDR is inserted.\n      net.ipv4.conf.all.rp_filter = 2\n      net.ipv4.conf.default.rp_filter = 2\n\n      # MASQUERADE burns one source port per concurrent flow toward the same target tuple.\n      # Spark with a high JDBC numPartitions opens many parallel connections, so the ephemeral\n      # range and the conntrack ceiling are the real scale limits on this appliance — not CPU.\n      net.ipv4.ip_local_port_range = 10000 65000\n      net.netfilter.nf_conntrack_max = 262144\n\n      # Detect a dead peer well inside the Private Link service's ~5 minute idle timeout so\n      # conntrack entries for reset flows are reclaimed promptly.\n      net.ipv4.tcp_keepalive_time = 120\n      net.ipv4.tcp_keepalive_intvl = 30\n      net.ipv4.tcp_keepalive_probes = 4\n\n  - path: /etc/private-link-forwarder/forward.map\n    permissions: '0644'\n    content: |\n      # listenPort targetHost targetPort\n      __FORWARD_MAP__\n\n  - path: /usr/local/sbin/private-link-forwarder\n    permissions: '0755'\n    content: |\n      #!/usr/bin/env bash\n      # Builds the DNAT/SNAT/forward rules for the Private Link forwarding appliance.\n      #\n      # All rules live in dedicated PLS_FORWARDER chains rather than in the built-in chains.\n      # That makes `apply` a full rebuild that is idempotent and atomic enough to re-run at any\n      # time, and makes `flush` able to remove everything this appliance owns without disturbing\n      # rules added by any other agent on the host.\n      set -euo pipefail\n\n      CHAIN=PLS_FORWARDER\n      MAP=/etc/private-link-forwarder/forward.map\n\n      # Derive the uplink instead of hardcoding eth0. Accelerated networking on D-series adds a\n      # bound VF interface, and a second NIC would shift the name — a wrong -i match here fails\n      # open as \"no forwarding at all\", which is the hardest symptom to diagnose.\n      uplink() {\n        local dev=''\n        dev=\"$( (ip -4 route show default 2>/dev/null || true) | awk '{print $5; exit}' )\" || true\n        printf '%s' \"${dev:-eth0}\"\n      }\n\n      # Emit each mapping as \"listenPort targetHost targetPort\", skipping comments and blanks.\n      mappings() {\n        [ -r \"$MAP\" ] || return 0\n        while read -r listen host port _rest; do\n          case \"${listen:-}\" in ''|\\#*) continue ;; esac\n          [ -n \"${host:-}\" ] && [ -n \"${port:-}\" ] || continue\n          printf '%s %s %s\\n' \"$listen\" \"$host\" \"$port\"\n        done < \"$MAP\"\n      }\n\n      ensure_chain() {\n        local table=\"$1\" parent=\"$2\"\n        iptables -t \"$table\" -N \"$CHAIN\" 2>/dev/null || iptables -t \"$table\" -F \"$CHAIN\"\n        iptables -t \"$table\" -C \"$parent\" -j \"$CHAIN\" 2>/dev/null \\\n          || iptables -t \"$table\" -I \"$parent\" 1 -j \"$CHAIN\"\n      }\n\n      apply() {\n        local dev\n        dev=\"$(uplink)\"\n\n        ensure_chain nat PREROUTING\n        ensure_chain nat POSTROUTING\n        ensure_chain filter FORWARD\n\n        while read -r listen host port; do\n          # Inbound from the load balancer: rewrite the destination to the real target.\n          iptables -t nat -A \"$CHAIN\" -i \"$dev\" -p tcp --dport \"$listen\" \\\n            -j DNAT --to-destination \"$host:$port\"\n          # Outbound to the target: rewrite the source to this instance, so the target needs a\n          # return route only to this VNet rather than to the Fabric managed VNet.\n          iptables -t nat -A \"$CHAIN\" -p tcp -d \"$host\" --dport \"$port\" -j MASQUERADE\n          iptables -A \"$CHAIN\" -p tcp -d \"$host\" --dport \"$port\" -j ACCEPT\n        done < <(mappings)\n\n        # Return traffic for every mapping, in one rule rather than one per target.\n        iptables -A \"$CHAIN\" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n      }\n\n      flush() {\n        local pair table parent\n        for pair in nat:PREROUTING nat:POSTROUTING filter:FORWARD; do\n          table=\"${pair%%:*}\"\n          parent=\"${pair##*:}\"\n          # Loop: a repeated apply/upgrade could have left more than one jump in place.\n          while iptables -t \"$table\" -C \"$parent\" -j \"$CHAIN\" 2>/dev/null; do\n            iptables -t \"$table\" -D \"$parent\" -j \"$CHAIN\"\n          done\n        done\n        for table in nat filter; do\n          iptables -t \"$table\" -F \"$CHAIN\" 2>/dev/null || true\n          iptables -t \"$table\" -X \"$CHAIN\" 2>/dev/null || true\n        done\n      }\n\n      # Exit 0 only when every rule this appliance owns is present. Used by the reconcile timer\n      # and by the health endpoint, so it must be cheap and must never mutate state.\n      verify() {\n        local dev found=0\n        dev=\"$(uplink)\"\n\n        iptables -t nat -C PREROUTING -j \"$CHAIN\" 2>/dev/null || return 1\n        iptables -t nat -C POSTROUTING -j \"$CHAIN\" 2>/dev/null || return 1\n        iptables -C FORWARD -j \"$CHAIN\" 2>/dev/null || return 1\n\n        while read -r listen host port; do\n          found=1\n          iptables -t nat -C \"$CHAIN\" -i \"$dev\" -p tcp --dport \"$listen\" \\\n            -j DNAT --to-destination \"$host:$port\" 2>/dev/null || return 1\n          iptables -t nat -C \"$CHAIN\" -p tcp -d \"$host\" --dport \"$port\" -j MASQUERADE 2>/dev/null || return 1\n        done < <(mappings)\n\n        # An empty map means the appliance is unconfigured, which is a failure, not a pass.\n        [ \"$found\" -eq 1 ] || return 1\n        [ \"$(cat /proc/sys/net/ipv4/ip_forward)\" = \"1\" ] || return 1\n        return 0\n      }\n\n      case \"${1:-apply}\" in\n        apply)     apply ;;\n        flush)     flush ;;\n        verify)    verify ;;\n        # Self-healing: repair drift only when there is drift, so the steady state never tears\n        # down live rules and no in-flight SYN can miss the DNAT during a rebuild window.\n        reconcile) verify || { flush; apply; } ;;\n        status)\n          iptables -t nat -L \"$CHAIN\" -n -v --line-numbers\n          iptables -L \"$CHAIN\" -n -v --line-numbers\n          ;;\n        *) echo \"usage: ${0##*/} {apply|flush|verify|reconcile|status}\" >&2; exit 64 ;;\n      esac\n\n  - path: /usr/local/sbin/private-link-healthcheck\n    permissions: '0755'\n    content: |\n      #!/usr/bin/env bash\n      # Socket-activated health responder for the Azure Application Health extension.\n      #\n      # It answers two independent questions, because either failing alone produces a silently\n      # broken appliance that a liveness-only probe (Learn's tutorial probes port 22) reports as\n      # healthy:\n      #\n      #   1. Are the forwarding rules actually installed right now?\n      #   2. Is at least one configured target actually accepting TCP right now?\n      #\n      # Note that (2) is a locally originated connection, so it traverses OUTPUT and does not\n      # exercise the DNAT rules — which is exactly why (1) is checked separately rather than\n      # assumed. Together they cover the full path.\n      #\n      # No `set -e`: a probe that opens the socket and stalls must produce a response, not an\n      # unhandled exit.\n\n      MAP=/etc/private-link-forwarder/forward.map\n\n      # Drain the HTTP request. The content is irrelevant; the timeouts guard against a stalled\n      # or half-open probe holding the socket-activated instance open.\n      read -r -t 2 _ || true\n      while IFS= read -r -t 1 line; do\n        [ -z \"${line%$'\\r'}\" ] && break\n      done\n\n      state=\"Healthy\"\n\n      /usr/local/sbin/private-link-forwarder verify >/dev/null 2>&1 || state=\"Unhealthy\"\n\n      if [ \"$state\" = \"Healthy\" ]; then\n        reachable=0\n        while read -r listen host port _rest; do\n          case \"${listen:-}\" in ''|\\#*) continue ;; esac\n          [ -n \"${host:-}\" ] && [ -n \"${port:-}\" ] || continue\n          if timeout 3 bash -c \"exec 3<>/dev/tcp/${host}/${port}\" 2>/dev/null; then\n            reachable=1\n            break\n          fi\n        done < \"$MAP\"\n        [ \"$reachable\" -eq 1 ] || state=\"Unhealthy\"\n      fi\n\n      # Rich Health States contract: always answer 2xx and carry the verdict in the body. A\n      # non-2xx is interpreted as \"Unknown\", which loses the distinction between \"the app says\n      # it is unhealthy\" and \"the probe could not reach the app at all\".\n      body=\"{\\\"ApplicationHealthState\\\":\\\"${state}\\\"}\"\n      printf 'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: %d\\r\\nConnection: close\\r\\n\\r\\n%s' \\\n        \"${#body}\" \"$body\"\n\n  - path: /etc/systemd/system/private-link-forwarder.service\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Private Link forwarding appliance rules\n      Documentation=https://github.com/AzureGovGuy/arm-pls-appliance\n      Wants=network-online.target\n      After=network-online.target systemd-sysctl.service\n      [Service]\n      Type=oneshot\n      RemainAfterExit=yes\n      ExecStart=/usr/local/sbin/private-link-forwarder apply\n      ExecReload=/usr/local/sbin/private-link-forwarder apply\n      ExecStop=/usr/local/sbin/private-link-forwarder flush\n      [Install]\n      WantedBy=multi-user.target\n\n  - path: /etc/systemd/system/private-link-forwarder-reconcile.service\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Reconcile Private Link forwarding appliance rules\n      After=private-link-forwarder.service\n      [Service]\n      Type=oneshot\n      ExecStart=/usr/local/sbin/private-link-forwarder reconcile\n\n  - path: /etc/systemd/system/private-link-forwarder-reconcile.timer\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Periodic drift check for Private Link forwarding rules\n      [Timer]\n      OnBootSec=2min\n      OnUnitActiveSec=5min\n      AccuracySec=30s\n      [Install]\n      WantedBy=timers.target\n\n  - path: /etc/systemd/system/private-link-health.socket\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Private Link forwarding appliance health endpoint\n      [Socket]\n      # Loopback only. The Application Health extension runs on the instance and probes locally,\n      # so this endpoint never needs to be reachable from the VNet and never needs an NSG rule.\n      ListenStream=127.0.0.1:__HEALTH_PORT__\n      Accept=yes\n      [Install]\n      WantedBy=sockets.target\n\n  - path: /etc/systemd/system/private-link-health@.service\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Private Link forwarding appliance health responder\n      [Service]\n      Type=simple\n      ExecStart=/usr/local/sbin/private-link-healthcheck\n      StandardInput=socket\n      StandardOutput=socket\n      StandardError=journal\n      TimeoutStartSec=15s\n\nruncmd:\n  - [modprobe, nf_conntrack]\n  - [sysctl, --system]\n  - [systemctl, daemon-reload]\n  - [systemctl, enable, --now, private-link-forwarder.service]\n  - [systemctl, enable, --now, private-link-forwarder-reconcile.timer]\n  - [systemctl, enable, --now, private-link-health.socket]\n\nfinal_message: 'Private Link forwarding appliance ready after $UPTIME seconds.'\n",
-    "cloudInit": "[replace(replace(variables('cloudInitTemplate'), '__FORWARD_MAP__', variables('forwardMapLine')), '__HEALTH_PORT__', string(parameters('healthPort')))]"
+    "forwardMap": "[join(variables('forwardMapLines'), variables('mapDelimiter'))]",
+    "cloudInitTemplate": "#cloud-config\n# Private Link forwarding appliance — VMSS instance bootstrap.\n#\n# This file is the single source of truth for instance configuration. `tools/Build-Template.ps1`\n# embeds it into the `cloudInitTemplate` variable in azuredeploy.json and ARM substitutes two\n# double-underscore placeholders at deploy time, so the template stays self-contained and\n# portal-deployable while this file remains reviewable as real YAML. Run the build script after\n# editing; deploy.ps1 refuses to deploy a template whose embedded copy has drifted from this file.\n#\n# The placeholders are the forwarding map in /etc/private-link-forwarder/forward.map, which\n# expands to newline-separated \"listenPort targetHost targetPort\" records — one per target — and\n# the loopback port in private-link-health.socket that serves the Application Health endpoint.\n# Each appears exactly once below, at its point of use. Do not repeat either token anywhere else\n# in this file, including in comments: substitution is a plain string replace, and the map is\n# multi-line, so a second occurrence injects unindented lines and breaks the YAML.\n#\n# Two constraints shape everything here:\n#\n#   1. No package installation. iptables, systemd and bash all ship in the Azure Ubuntu\n#      marketplace image. VMSS instances in Flexible orchestration have no default outbound\n#      internet access, and platform default outbound access retired in September 2025, so a\n#      cloud-init that runs `apt install` hangs for the whole boot in a locked-down subnet.\n#      Everything below works with zero egress.\n#\n#   2. Convergence, not first-boot setup. iptables rules live in the kernel and are lost on\n#      every reboot. Nothing here writes rules once; a systemd unit rebuilds them at boot and a\n#      timer reconciles drift, so reboot, platform patching, reimage and scale-out all land on\n#      identical state.\n\npackage_update: false\npackage_upgrade: false\n\nwrite_files:\n  # nf_conntrack must be resident before systemd-sysctl applies the tunables below, otherwise\n  # net.netfilter.* keys do not exist yet and are silently skipped at early boot.\n  - path: /etc/modules-load.d/private-link-forwarder.conf\n    permissions: '0644'\n    content: |\n      nf_conntrack\n\n  - path: /etc/sysctl.d/99-private-link-forwarder.conf\n    permissions: '0644'\n    content: |\n      # The Azure NIC has enableIPForwarding=true; this is the matching guest-side half.\n      # Both are required — either one alone silently blackholes forwarded traffic.\n      net.ipv4.ip_forward = 1\n\n      # Loose reverse-path filtering. Return traffic from on-premises can arrive on a path the\n      # strict check does not consider symmetric once a hub firewall or UDR is inserted.\n      net.ipv4.conf.all.rp_filter = 2\n      net.ipv4.conf.default.rp_filter = 2\n\n      # MASQUERADE burns one source port per concurrent flow toward the same target tuple.\n      # Spark with a high JDBC numPartitions opens many parallel connections, so the ephemeral\n      # range and the conntrack ceiling are the real scale limits on this appliance — not CPU.\n      net.ipv4.ip_local_port_range = 10000 65000\n      net.netfilter.nf_conntrack_max = 262144\n\n      # Detect a dead peer well inside the Private Link service's ~5 minute idle timeout so\n      # conntrack entries for reset flows are reclaimed promptly.\n      net.ipv4.tcp_keepalive_time = 120\n      net.ipv4.tcp_keepalive_intvl = 30\n      net.ipv4.tcp_keepalive_probes = 4\n\n  - path: /etc/private-link-forwarder/forward.map\n    permissions: '0644'\n    content: |\n      # listenPort targetHost targetPort\n      __FORWARD_MAP__\n\n  - path: /usr/local/sbin/private-link-forwarder\n    permissions: '0755'\n    content: |\n      #!/usr/bin/env bash\n      # Builds the DNAT/SNAT/forward rules for the Private Link forwarding appliance.\n      #\n      # All rules live in dedicated PLS_FORWARDER chains rather than in the built-in chains.\n      # That makes `apply` a full rebuild that is idempotent and atomic enough to re-run at any\n      # time, and makes `flush` able to remove everything this appliance owns without disturbing\n      # rules added by any other agent on the host.\n      set -euo pipefail\n\n      CHAIN=PLS_FORWARDER\n      MAP=/etc/private-link-forwarder/forward.map\n\n      # Derive the uplink instead of hardcoding eth0. Accelerated networking on D-series adds a\n      # bound VF interface, and a second NIC would shift the name — a wrong -i match here fails\n      # open as \"no forwarding at all\", which is the hardest symptom to diagnose.\n      uplink() {\n        local dev=''\n        dev=\"$( (ip -4 route show default 2>/dev/null || true) | awk '{print $5; exit}' )\" || true\n        printf '%s' \"${dev:-eth0}\"\n      }\n\n      # Emit each mapping as \"listenPort targetHost targetPort\", skipping comments and blanks.\n      mappings() {\n        [ -r \"$MAP\" ] || return 0\n        while read -r listen host port _rest; do\n          case \"${listen:-}\" in ''|\\#*) continue ;; esac\n          [ -n \"${host:-}\" ] && [ -n \"${port:-}\" ] || continue\n          printf '%s %s %s\\n' \"$listen\" \"$host\" \"$port\"\n        done < \"$MAP\"\n      }\n\n      ensure_chain() {\n        local table=\"$1\" parent=\"$2\"\n        iptables -t \"$table\" -N \"$CHAIN\" 2>/dev/null || iptables -t \"$table\" -F \"$CHAIN\"\n        iptables -t \"$table\" -C \"$parent\" -j \"$CHAIN\" 2>/dev/null \\\n          || iptables -t \"$table\" -I \"$parent\" 1 -j \"$CHAIN\"\n      }\n\n      apply() {\n        local dev\n        dev=\"$(uplink)\"\n\n        ensure_chain nat PREROUTING\n        ensure_chain nat POSTROUTING\n        ensure_chain filter FORWARD\n\n        while read -r listen host port; do\n          # Inbound from the load balancer: rewrite the destination to the real target.\n          iptables -t nat -A \"$CHAIN\" -i \"$dev\" -p tcp --dport \"$listen\" \\\n            -j DNAT --to-destination \"$host:$port\"\n          # Outbound to the target: rewrite the source to this instance, so the target needs a\n          # return route only to this VNet rather than to the Fabric managed VNet.\n          iptables -t nat -A \"$CHAIN\" -p tcp -d \"$host\" --dport \"$port\" -j MASQUERADE\n          iptables -A \"$CHAIN\" -p tcp -d \"$host\" --dport \"$port\" -j ACCEPT\n        done < <(mappings)\n\n        # Return traffic for every mapping, in one rule rather than one per target.\n        iptables -A \"$CHAIN\" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n      }\n\n      flush() {\n        local pair table parent\n        for pair in nat:PREROUTING nat:POSTROUTING filter:FORWARD; do\n          table=\"${pair%%:*}\"\n          parent=\"${pair##*:}\"\n          # Loop: a repeated apply/upgrade could have left more than one jump in place.\n          while iptables -t \"$table\" -C \"$parent\" -j \"$CHAIN\" 2>/dev/null; do\n            iptables -t \"$table\" -D \"$parent\" -j \"$CHAIN\"\n          done\n        done\n        for table in nat filter; do\n          iptables -t \"$table\" -F \"$CHAIN\" 2>/dev/null || true\n          iptables -t \"$table\" -X \"$CHAIN\" 2>/dev/null || true\n        done\n      }\n\n      # Exit 0 only when every rule this appliance owns is present. Used by the reconcile timer\n      # and by the health endpoint, so it must be cheap and must never mutate state.\n      verify() {\n        local dev found=0\n        dev=\"$(uplink)\"\n\n        iptables -t nat -C PREROUTING -j \"$CHAIN\" 2>/dev/null || return 1\n        iptables -t nat -C POSTROUTING -j \"$CHAIN\" 2>/dev/null || return 1\n        iptables -C FORWARD -j \"$CHAIN\" 2>/dev/null || return 1\n\n        while read -r listen host port; do\n          found=1\n          iptables -t nat -C \"$CHAIN\" -i \"$dev\" -p tcp --dport \"$listen\" \\\n            -j DNAT --to-destination \"$host:$port\" 2>/dev/null || return 1\n          iptables -t nat -C \"$CHAIN\" -p tcp -d \"$host\" --dport \"$port\" -j MASQUERADE 2>/dev/null || return 1\n        done < <(mappings)\n\n        # An empty map means the appliance is unconfigured, which is a failure, not a pass.\n        [ \"$found\" -eq 1 ] || return 1\n        [ \"$(cat /proc/sys/net/ipv4/ip_forward)\" = \"1\" ] || return 1\n        return 0\n      }\n\n      case \"${1:-apply}\" in\n        apply)     apply ;;\n        flush)     flush ;;\n        verify)    verify ;;\n        # Self-healing: repair drift only when there is drift, so the steady state never tears\n        # down live rules and no in-flight SYN can miss the DNAT during a rebuild window.\n        reconcile) verify || { flush; apply; } ;;\n        status)\n          iptables -t nat -L \"$CHAIN\" -n -v --line-numbers\n          iptables -L \"$CHAIN\" -n -v --line-numbers\n          ;;\n        *) echo \"usage: ${0##*/} {apply|flush|verify|reconcile|status}\" >&2; exit 64 ;;\n      esac\n\n  - path: /usr/local/sbin/private-link-healthcheck\n    permissions: '0755'\n    content: |\n      #!/usr/bin/env bash\n      # Socket-activated health responder for the Azure Application Health extension.\n      #\n      # It answers two independent questions, because either failing alone produces a silently\n      # broken appliance that a liveness-only probe (Learn's tutorial probes port 22) reports as\n      # healthy:\n      #\n      #   1. Are the forwarding rules actually installed right now?\n      #   2. Is at least one configured target actually accepting TCP right now?\n      #\n      # Note that (2) is a locally originated connection, so it traverses OUTPUT and does not\n      # exercise the DNAT rules — which is exactly why (1) is checked separately rather than\n      # assumed. Together they cover the full path.\n      #\n      # No `set -e`: a probe that opens the socket and stalls must produce a response, not an\n      # unhandled exit.\n\n      MAP=/etc/private-link-forwarder/forward.map\n\n      # Drain the HTTP request. The content is irrelevant; the timeouts guard against a stalled\n      # or half-open probe holding the socket-activated instance open.\n      read -r -t 2 _ || true\n      while IFS= read -r -t 1 line; do\n        [ -z \"${line%$'\\r'}\" ] && break\n      done\n\n      state=\"Healthy\"\n\n      /usr/local/sbin/private-link-forwarder verify >/dev/null 2>&1 || state=\"Unhealthy\"\n\n      if [ \"$state\" = \"Healthy\" ]; then\n        reachable=0\n        while read -r listen host port _rest; do\n          case \"${listen:-}\" in ''|\\#*) continue ;; esac\n          [ -n \"${host:-}\" ] && [ -n \"${port:-}\" ] || continue\n          if timeout 3 bash -c \"exec 3<>/dev/tcp/${host}/${port}\" 2>/dev/null; then\n            reachable=1\n            break\n          fi\n        done < \"$MAP\"\n        [ \"$reachable\" -eq 1 ] || state=\"Unhealthy\"\n      fi\n\n      # Rich Health States contract: always answer 2xx and carry the verdict in the body. A\n      # non-2xx is interpreted as \"Unknown\", which loses the distinction between \"the app says\n      # it is unhealthy\" and \"the probe could not reach the app at all\".\n      body=\"{\\\"ApplicationHealthState\\\":\\\"${state}\\\"}\"\n      printf 'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: %d\\r\\nConnection: close\\r\\n\\r\\n%s' \\\n        \"${#body}\" \"$body\"\n\n  - path: /etc/systemd/system/private-link-forwarder.service\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Private Link forwarding appliance rules\n      Documentation=https://github.com/AzureGovGuy/arm-pls-appliance\n      Wants=network-online.target\n      After=network-online.target systemd-sysctl.service\n      [Service]\n      Type=oneshot\n      RemainAfterExit=yes\n      ExecStart=/usr/local/sbin/private-link-forwarder apply\n      ExecReload=/usr/local/sbin/private-link-forwarder apply\n      ExecStop=/usr/local/sbin/private-link-forwarder flush\n      [Install]\n      WantedBy=multi-user.target\n\n  - path: /etc/systemd/system/private-link-forwarder-reconcile.service\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Reconcile Private Link forwarding appliance rules\n      After=private-link-forwarder.service\n      [Service]\n      Type=oneshot\n      ExecStart=/usr/local/sbin/private-link-forwarder reconcile\n\n  - path: /etc/systemd/system/private-link-forwarder-reconcile.timer\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Periodic drift check for Private Link forwarding rules\n      [Timer]\n      OnBootSec=2min\n      OnUnitActiveSec=5min\n      AccuracySec=30s\n      [Install]\n      WantedBy=timers.target\n\n  - path: /etc/systemd/system/private-link-health.socket\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Private Link forwarding appliance health endpoint\n      [Socket]\n      # Loopback only. The Application Health extension runs on the instance and probes locally,\n      # so this endpoint never needs to be reachable from the VNet and never needs an NSG rule.\n      ListenStream=127.0.0.1:__HEALTH_PORT__\n      Accept=yes\n      [Install]\n      WantedBy=sockets.target\n\n  - path: /etc/systemd/system/private-link-health@.service\n    permissions: '0644'\n    content: |\n      [Unit]\n      Description=Private Link forwarding appliance health responder\n      [Service]\n      Type=simple\n      ExecStart=/usr/local/sbin/private-link-healthcheck\n      StandardInput=socket\n      StandardOutput=socket\n      StandardError=journal\n      TimeoutStartSec=15s\n\nruncmd:\n  - [modprobe, nf_conntrack]\n  - [sysctl, --system]\n  - [systemctl, daemon-reload]\n  - [systemctl, enable, --now, private-link-forwarder.service]\n  - [systemctl, enable, --now, private-link-forwarder-reconcile.timer]\n  - [systemctl, enable, --now, private-link-health.socket]\n\nfinal_message: 'Private Link forwarding appliance ready after $UPTIME seconds.'\n",
+    "cloudInit": "[replace(replace(variables('cloudInitTemplate'), '__FORWARD_MAP__', variables('forwardMap')), '__HEALTH_PORT__', string(parameters('healthPort')))]"
   },
   "resources": [
     {
@@ -357,15 +370,56 @@
         "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
       ],
       "properties": {
-        "frontendIPConfigurations": [
+        "copy": [
           {
-            "name": "[variables('lbFrontendName')]",
-            "properties": {
-              "privateIPAddress": "[parameters('loadBalancerPrivateIp')]",
-              "privateIPAllocationMethod": "Static",
-              "privateIPAddressVersion": "IPv4",
-              "subnet": {
-                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('lbSubnetName'))]"
+            "name": "frontendIPConfigurations",
+            "count": "[length(parameters('targets'))]",
+            "input": {
+              "name": "[format('{0}-frontend', parameters('targets')[copyIndex('frontendIPConfigurations')].name)]",
+              "properties": {
+                "privateIPAddress": "[variables('frontendIps')[copyIndex('frontendIPConfigurations')]]",
+                "privateIPAllocationMethod": "Static",
+                "privateIPAddressVersion": "IPv4",
+                "subnet": {
+                  "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('lbSubnetName'))]"
+                }
+              }
+            }
+          },
+          {
+            "name": "probes",
+            "count": "[length(parameters('targets'))]",
+            "input": {
+              "name": "[format('{0}-probe', parameters('targets')[copyIndex('probes')].name)]",
+              "properties": {
+                "protocol": "Tcp",
+                "port": "[add(parameters('backendPortBase'), copyIndex('probes'))]",
+                "intervalInSeconds": 15,
+                "numberOfProbes": 2
+              }
+            }
+          },
+          {
+            "name": "loadBalancingRules",
+            "count": "[length(parameters('targets'))]",
+            "input": {
+              "name": "[format('{0}-forward', parameters('targets')[copyIndex('loadBalancingRules')].name)]",
+              "properties": {
+                "protocol": "Tcp",
+                "frontendPort": "[parameters('targets')[copyIndex('loadBalancingRules')].port]",
+                "backendPort": "[add(parameters('backendPortBase'), copyIndex('loadBalancingRules'))]",
+                "idleTimeoutInMinutes": 15,
+                "enableFloatingIP": false,
+                "disableOutboundSnat": true,
+                "frontendIPConfiguration": {
+                  "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('lbName'), format('{0}-frontend', parameters('targets')[copyIndex('loadBalancingRules')].name))]"
+                },
+                "backendAddressPool": {
+                  "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('lbName'), variables('lbBackendPoolName'))]"
+                },
+                "probe": {
+                  "id": "[resourceId('Microsoft.Network/loadBalancers/probes', variables('lbName'), format('{0}-probe', parameters('targets')[copyIndex('loadBalancingRules')].name))]"
+                }
               }
             }
           }
@@ -373,39 +427,6 @@
         "backendAddressPools": [
           {
             "name": "[variables('lbBackendPoolName')]"
-          }
-        ],
-        "probes": [
-          {
-            "name": "[variables('lbProbeName')]",
-            "properties": {
-              "protocol": "Tcp",
-              "port": "[parameters('targetPort')]",
-              "intervalInSeconds": 15,
-              "numberOfProbes": 2
-            }
-          }
-        ],
-        "loadBalancingRules": [
-          {
-            "name": "[variables('lbRuleName')]",
-            "properties": {
-              "protocol": "Tcp",
-              "frontendPort": "[parameters('targetPort')]",
-              "backendPort": "[parameters('targetPort')]",
-              "idleTimeoutInMinutes": 15,
-              "enableFloatingIP": false,
-              "disableOutboundSnat": true,
-              "frontendIPConfiguration": {
-                "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('lbName'), variables('lbFrontendName'))]"
-              },
-              "backendAddressPool": {
-                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('lbName'), variables('lbBackendPoolName'))]"
-              },
-              "probe": {
-                "id": "[resourceId('Microsoft.Network/loadBalancers/probes', variables('lbName'), variables('lbProbeName'))]"
-              }
-            }
           }
         ]
       }
@@ -543,9 +564,15 @@
     {
       "type": "Microsoft.Network/privateLinkServices",
       "apiVersion": "2023-11-01",
-      "name": "[variables('plsName')]",
+      "name": "[format('{0}-pls-{1}', parameters('prefix'), parameters('targets')[copyIndex()].name)]",
       "location": "[parameters('location')]",
       "tags": "[parameters('tags')]",
+      "copy": {
+        "name": "privateLinkServiceCopy",
+        "count": "[length(parameters('targets'))]",
+        "mode": "Serial",
+        "batchSize": 1
+      },
       "dependsOn": [
         "[resourceId('Microsoft.Network/loadBalancers', variables('lbName'))]",
         "[resourceId('Microsoft.Compute/virtualMachineScaleSets', variables('vmssName'))]"
@@ -553,14 +580,14 @@
       "properties": {
         "loadBalancerFrontendIpConfigurations": [
           {
-            "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('lbName'), variables('lbFrontendName'))]"
+            "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('lbName'), format('{0}-frontend', parameters('targets')[copyIndex()].name))]"
           }
         ],
         "ipConfigurations": [
           {
             "name": "primary",
             "properties": {
-              "privateIPAddress": "[parameters('privateLinkServiceNatIp')]",
+              "privateIPAddress": "[variables('natIps')[copyIndex()]]",
               "privateIPAllocationMethod": "Static",
               "privateIPAddressVersion": "IPv4",
               "primary": true,
@@ -589,17 +616,25 @@
       "type": "string",
       "value": "[variables('vnetName')]"
     },
-    "privateLinkServiceId": {
-      "type": "string",
-      "value": "[resourceId('Microsoft.Network/privateLinkServices', variables('plsName'))]"
-    },
-    "privateLinkServiceAlias": {
-      "type": "string",
-      "value": "[reference(resourceId('Microsoft.Network/privateLinkServices', variables('plsName')), '2023-11-01').alias]"
-    },
-    "loadBalancerPrivateIp": {
-      "type": "string",
-      "value": "[parameters('loadBalancerPrivateIp')]"
+    "privateLinkServices": {
+      "type": "array",
+      "copy": {
+        "count": "[length(parameters('targets'))]",
+        "input": {
+          "name": "[parameters('targets')[copyIndex()].name]",
+          "privateLinkServiceName": "[format('{0}-pls-{1}', parameters('prefix'), parameters('targets')[copyIndex()].name)]",
+          "alias": "[reference(resourceId('Microsoft.Network/privateLinkServices', format('{0}-pls-{1}', parameters('prefix'), parameters('targets')[copyIndex()].name)), '2023-11-01').alias]",
+          "resourceId": "[resourceId('Microsoft.Network/privateLinkServices', format('{0}-pls-{1}', parameters('prefix'), parameters('targets')[copyIndex()].name))]",
+          "target": "[format('{0}:{1}', parameters('targets')[copyIndex()].host, string(parameters('targets')[copyIndex()].port))]",
+          "consumerPort": "[parameters('targets')[copyIndex()].port]",
+          "loadBalancerFrontendIp": "[variables('frontendIps')[copyIndex()]]",
+          "privateLinkServiceNatIp": "[variables('natIps')[copyIndex()]]",
+          "backendPort": "[add(parameters('backendPortBase'), copyIndex())]"
+        }
+      },
+      "metadata": {
+        "description": "One record per target. Create a managed private endpoint against each alias, using the target server's own FQDN as the resource name, and connect on consumerPort. backendPort is internal plumbing and is never used by a consumer."
+      }
     },
     "scaleSetName": {
       "type": "string",
@@ -615,10 +650,6 @@
     "internetEgressEnabled": {
       "type": "bool",
       "value": "[parameters('enableInternetEgress')]"
-    },
-    "target": {
-      "type": "string",
-      "value": "[format('{0}:{1}', parameters('targetSQLServer'), parameters('targetPort'))]"
     }
   }
 }

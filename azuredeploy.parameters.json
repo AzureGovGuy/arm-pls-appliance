@@ -5,11 +5,19 @@
     "prefix": {
       "value": "customer-pls-lab"
     },
-    "targetSQLServer": {
-      "value": "10.40.1.4"
-    },
-    "targetPort": {
-      "value": 1433
+    "targets": {
+      "value": [
+        {
+          "name": "sqlprod01",
+          "host": "10.40.1.4",
+          "port": 1433
+        },
+        {
+          "name": "sqlprod02",
+          "host": "10.40.1.5",
+          "port": 1433
+        }
+      ]
     },
     "adminSshPublicKey": {
       "value": "REPLACE_WITH_AN_SSH_PUBLIC_KEY"

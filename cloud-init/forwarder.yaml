@@ -2,13 +2,17 @@
 # Private Link forwarding appliance — VMSS instance bootstrap.
 #
 # This file is the single source of truth for instance configuration. `tools/Build-Template.ps1`
-# embeds it into the `cloudInitTemplate` variable in azuredeploy.json and ARM substitutes the two
-# placeholders below at deploy time, so the template stays self-contained and portal-deployable
-# while this file remains reviewable as real YAML. Run the build script after editing; deploy.ps1
-# refuses to deploy a template whose embedded copy has drifted from this file.
+# embeds it into the `cloudInitTemplate` variable in azuredeploy.json and ARM substitutes two
+# double-underscore placeholders at deploy time, so the template stays self-contained and
+# portal-deployable while this file remains reviewable as real YAML. Run the build script after
+# editing; deploy.ps1 refuses to deploy a template whose embedded copy has drifted from this file.
 #
-#   __FORWARD_MAP__   newline-separated "listenPort targetHost targetPort" records
-#   __HEALTH_PORT__   loopback TCP port serving the health endpoint for the Application Health extension
+# The placeholders are the forwarding map in /etc/private-link-forwarder/forward.map, which
+# expands to newline-separated "listenPort targetHost targetPort" records — one per target — and
+# the loopback port in private-link-health.socket that serves the Application Health endpoint.
+# Each appears exactly once below, at its point of use. Do not repeat either token anywhere else
+# in this file, including in comments: substitution is a plain string replace, and the map is
+# multi-line, so a second occurrence injects unindented lines and breaks the YAML.
 #
 # Two constraints shape everything here:
 #

@@ -126,6 +126,36 @@ printf '# listenPort targetHost targetPort\n' > "$WORK/forward.map"
 printf '# listenPort targetHost targetPort\n1433 10.100.5.20 1433\n' > "$WORK/forward.map"
 "$FWD" apply >/dev/null 2>&1
 
+echo "== multiple targets =="
+printf '# listenPort targetHost targetPort\n11433 10.30.1.4 1433\n11434 10.30.1.5 1433\n11435 10.30.1.6 1433\n11436 10.30.1.7 1433\n' > "$WORK/forward.map"
+"$FWD" flush >/dev/null 2>&1
+"$FWD" apply; check "apply succeeds with four targets" 0 $?
+"$FWD" verify; check "verify passes with four targets" 0 $?
+multi=$(grep -c 'DNAT --to-destination' "$STATE")
+echo "  DNAT rules: $multi"
+[ "$multi" = 4 ] && check "one DNAT rule per target" 0 0 || check "one DNAT rule per target" 0 1
+
+# The load balancer backend cannot see which frontend a packet arrived on, so the backend port is
+# the only discriminator. If two targets ever shared one, traffic for both would silently collapse
+# onto whichever DNAT rule matched first.
+pairs=0
+for spec in '11433 10.30.1.4' '11434 10.30.1.5' '11435 10.30.1.6' '11436 10.30.1.7'; do
+    set -- $spec
+    grep -q -- "--dport $1 -j DNAT --to-destination $2:1433" "$STATE" && pairs=$((pairs + 1))
+done
+echo "  correctly mapped ports: $pairs"
+[ "$pairs" = 4 ] && check "each backend port maps to its own target" 0 0 || check "each backend port maps to its own target" 0 1
+
+# Drift on one target must not be masked by the other three still being correct.
+grep -v -- '--dport 11435 -j DNAT' "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+"$FWD" verify; check "verify fails when one of four targets drifts" 1 $?
+"$FWD" reconcile >/dev/null 2>&1
+"$FWD" verify; check "reconcile repairs a single drifted target" 0 $?
+
+printf '# listenPort targetHost targetPort\n1433 10.100.5.20 1433\n' > "$WORK/forward.map"
+"$FWD" flush >/dev/null 2>&1
+"$FWD" apply >/dev/null 2>&1
+
 echo "== flush =="
 "$FWD" flush; check "flush succeeds" 0 $?
 "$FWD" verify; check "verify fails after flush" 1 $?
